@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import assert from 'node:assert/strict'
-const base = 'https://geoskill.7chacha.com'
+const base = (await import('./test-target-guard.mjs')).localTestTarget()
 const out = 'outputs/template-retest-6.2.1'
 await fs.mkdir(out, { recursive: true })
 const credentials = JSON.parse(await fs.readFile('.tmp/commercial-credentials.json', 'utf8'))

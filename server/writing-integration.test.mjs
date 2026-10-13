@@ -2,9 +2,19 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 
+test('only current writing direction is loaded; retired title prompts are not sealed', () => {
+  const source = fs.readFileSync(new URL('./agents-workflow.mjs', import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /read\('headline(?:-final)?\.md'\)/)
+  const manifest = JSON.parse(fs.readFileSync(new URL('./writing-release.json', import.meta.url), 'utf8'))
+  assert.ok(manifest.files['agents/selection-direction.md'])
+  assert.equal(manifest.files['agents/headline.md'], undefined)
+  assert.equal(manifest.files['agents/headline-final.md'], undefined)
+})
+
 test('server active path delegates to sealed engine', () => {
   const source = fs.readFileSync(new URL('./geo-api-server.mjs', import.meta.url), 'utf8')
-  const active = source.slice(source.indexOf('async function generateFreeWritingArticle(payload'), source.indexOf('async function legacyGenerateFreeWritingArticle('))
+  const active = source.slice(source.indexOf('async function generateFreeWritingArticle(payload'), source.indexOf('async function generateArticleFromPlan('))
+  assert.doesNotMatch(source, /function legacyGenerateFreeWritingArticle|function legacyBuildServerArticlePlans/)
   assert.ok(active.includes('return runWritingEngine('))
   assert.ok(!/cleanProduction|repair|callQwen\(/.test(active))
   assert.ok(source.includes('production: firstDraft.production'))
@@ -18,4 +28,15 @@ test('host inserts images without applying legacy title stripping to the parsed 
   assert.ok(storing.includes('insertGalleryImagesIntoArticle(rawBody,'))
   assert.doesNotMatch(storing, /stripFreeArticleTitle|cleanProduction|repairArticle/)
   assert.ok(storing.includes('body: rawBody'))
+})
+
+test('jobs persist agent handoffs and stop on transport failure instead of storing error articles', () => {
+  const source = fs.readFileSync(new URL('./geo-api-server.mjs', import.meta.url), 'utf8')
+  assert.ok(source.includes('prepareAgentBatch(body, plans'))
+  assert.ok(source.includes('state: job.workflow'))
+  assert.ok(source.includes('articleId: `${job.id}:${index}`'))
+  const start = source.indexOf('const firstDraft = await generateFreeWritingArticle(nextBody')
+  const failure = source.slice(start, source.indexOf('const fallbackTitle = nextBody.plan.title', start))
+  assert.ok(failure.includes('return { ok: false, error: reason }'))
+  assert.ok(source.includes("requestUrl.pathname === '/api/jobs/resume'"))
 })

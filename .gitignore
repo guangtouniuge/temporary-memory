@@ -20,3 +20,9 @@ Thumbs.db
 # Account credentials, sessions and tenant data
 outputs/auth/
 outputs/workspaces/
+outputs/projects/
+outputs/data/
+outputs/acceptance/
+.tmp*/
+deploy/*.tgz
+deploy/*.zip

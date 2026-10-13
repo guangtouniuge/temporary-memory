@@ -23,6 +23,16 @@ test('journal survives reopening with plans, articles and checkpoint unchanged',
   assert.equal(reopened.load(record.job.id).job.articles[0].id, 'saved')
   assert.equal(reopened.load('../../etc'), null)
 })
+test('topic memory includes failed plans, excludes current/deleted jobs and other account projects', t => {
+  const journal=setup(t)
+  for(const [id,scope,status,deletedAt] of [['past','account-a:brand','failed'],['current','account-a:brand','running'],['other','account-b:brand','done'],['deleted','account-a:brand','done','date']]) {
+    journal.save({job:{id:`JOB-${id}`,storageScope:scope,status,deletedAt},plans:[{editorialBrief:{businessProblem:id}}]})
+  }
+  const memory=new JobJournal(journal.root).topicHistory('account-a:brand','JOB-current')
+  assert.deepEqual(memory.map(row=>row.brief.businessProblem),['past'])
+  assert.deepEqual(journal.topicHistory('',undefined),[])
+})
+
 test('same-project work is serialized, distinct projects remain independent', async t => {
   const journal = setup(t)
   const order = []

@@ -1,8 +1,10 @@
 import fs from 'node:fs/promises'
 import assert from 'node:assert/strict'
 import { chromium } from 'playwright'
-const credentials = JSON.parse(await fs.readFile('.tmp/commercial-credentials.json', 'utf8'))
-const base = 'https://geoskill.7chacha.com'
+const base = process.env.GEO_TEST_BASE || 'http://127.0.0.1:8787'
+if (!['127.0.0.1', 'localhost', '[::1]'].includes(new URL(base).hostname)) throw new Error('Mutating acceptance tests are restricted to isolated local environments')
+if (!process.env.GEO_TEST_CREDENTIALS) throw new Error('Provide isolated test credentials; production credentials must not be reused')
+const credentials = JSON.parse(await fs.readFile(process.env.GEO_TEST_CREDENTIALS, 'utf8'))
 const out = 'outputs/commercial-acceptance'
 await fs.mkdir(out, { recursive: true })
 async function api(route, body, cookie = '', headers = {}) {
@@ -43,7 +45,12 @@ try {
   assert.equal((await api('/api/state?key=geo.projectRows', undefined, a.cookie)).status, 200)
   assert.equal((await api('/api/state?key=geo.projectRows', undefined, agency.cookie, { 'x-geo-project-id': 'exposure-main' })).status, 403)
 } finally {
-  for (const id of ids.reverse()) await api('/api/admin/users/update', { id, status: 'disabled' }, admin)
+  const failures=[]
+  for (const id of ids.reverse()) {
+    const result=await api('/api/admin/users/delete', { id }, admin).catch(error=>({status:0,data:{error:error.message}}))
+    if(result.status!==200)failures.push({id,error:result.data?.error})
+  }
+  if(failures.length)throw new Error('Test cleanup incomplete: '+JSON.stringify(failures))
 }
 console.log('PASS: anonymous and forged access rejected; real agent/project/operator isolation; disabled sessions revoked; migrated articles retained.')
 const browser = await chromium.launch({ channel: 'chrome', headless: true })

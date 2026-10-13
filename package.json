@@ -10,10 +10,13 @@
     "dev:all": "node server/geo-api-server.mjs & vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "npm run build && npm run test:auth && npm run test:project-isolation && npm run test:writing",
-    "test:writing": "node --test server/skill-editor.test.mjs server/batch-editor.test.mjs server/article-format.test.mjs server/writing-engine.test.mjs server/writing-integration.test.mjs server/job-journal.test.mjs server/gallery-placement.test.mjs server/model-request.test.mjs",
-    "test:auth": "node --test server/auth.test.mjs",
-    "test:project-isolation": "node --test server/project-scope.test.mjs server/project-ui.test.mjs server/frontend-production.test.mjs"
+    "test": "npm run build && npm run test:auth && npm run test:project-isolation && npm run test:writing && npm run test:security && npm run test:business && npm run test:media",
+    "test:business": "node scripts/accept-restored-business.mjs && node --test server/volcengine-images.test.mjs server/image-billing.test.mjs server/gallery-browser-ui.test.mjs server/initial-allocation.test.mjs server/initial-allocation-ui.test.mjs",
+    "test:media": "node --test server/xiaoqingwa-client.test.mjs server/media-catalog.test.mjs server/media-ui.test.mjs server/news-orders.test.mjs server/news-publishing.test.mjs server/news-ui.test.mjs",
+    "test:security": "node scripts/audit-commercial-security.mjs && node --test server/recovery-boundaries.test.mjs server/resource-capacity.test.mjs server/commercial-acceptance.test.mjs server/member-ledger.test.mjs server/member-packages.test.mjs server/member-ledger-ui.test.mjs server/platform-admin.test.mjs server/platform-admin-ui.test.mjs",
+    "test:writing": "node --test server/model-json.test.mjs server/writing-scene.test.mjs server/business-scenes.test.mjs server/business-scenes-ui.test.mjs server/keyword-distillation.test.mjs server/keyword-distillation-ui.test.mjs server/skill-editor.test.mjs server/batch-editor.test.mjs server/article-format.test.mjs server/writing-engine.test.mjs server/writing-integration.test.mjs server/job-journal.test.mjs server/gallery-placement.test.mjs server/model-request.test.mjs",
+    "test:auth": "node --test server/auth.test.mjs server/model-response.test.mjs",
+    "test:project-isolation": "node --test server/project-scope.test.mjs server/project-ui.test.mjs server/frontend-production.test.mjs server/workflow-mapping.test.mjs server/workflow-ui.test.mjs server/task-history-ui.test.mjs server/list-pagination-ui.test.mjs server/provider-ui.test.mjs server/article-clean-ui.test.mjs server/provider-research.test.mjs"
   },
   "repository": {
     "type": "git",
@@ -29,7 +32,9 @@
   "homepage": "https://github.com/guangtouniuge/gongju#readme",
   "dependencies": {
     "@vitejs/plugin-react": "^6.1.1",
+    "better-sqlite3": "^12.11.1",
     "dompurify": "^3.4.15",
+    "jsonrepair": "3.15.0",
     "lucide-react": "^1.35.0",
     "marked": "^18.0.12",
     "react": "^19.2.8",

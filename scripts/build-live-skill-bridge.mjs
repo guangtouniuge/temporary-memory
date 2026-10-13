@@ -1,5 +1,6 @@
 // Build a generation-only release for installations predating account migration.
 import fs from 'node:fs'
+throw new Error('旧匿名生成桥接已停用；请使用保留账号隔离的当前部署脚本')
 const path = '.tmp/live-skill-release/server/geo-api-server.mjs'
 let live = fs.readFileSync(path, 'utf8').replace(/^import .* from '\.\/(?:skill-editor|batch-editor|article-format|writing-engine|job-journal)\.mjs'\r?\n/gm, '')
 const current = fs.readFileSync('server/geo-api-server.mjs', 'utf8')

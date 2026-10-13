@@ -1,0 +1,15 @@
+.workflow-modal{width:min(820px,calc(100vw - 32px));max-height:90vh;overflow:auto}
+.workflow-panel-toolbar{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:16px 0;flex-wrap:wrap}
+.workflow-panel-toolbar label,.workflow-notes{display:grid;gap:8px;flex:1;min-width:180px}
+.workflow-panel-toolbar select,.workflow-notes textarea{font:inherit;width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid #d7deea;border-radius:6px;background:white;color:#202938}
+.workflow-panel-toolbar button,.workflow-modal .modal-actions button{display:inline-flex;align-items:center;gap:8px}
+.workflow-reading{font-size:14px;line-height:1.8;overflow-wrap:anywhere}
+.workflow-reading h3,.workflow-details h3{font-size:15px;margin:20px 0 10px}
+.workflow-reading p{white-space:pre-wrap;margin:8px 0}
+.workflow-evidence{border-bottom:1px solid #e5e9ef;padding:12px 0}
+.workflow-evidence blockquote{margin:10px 0;padding:8px 12px;border-left:3px solid #d7deea}
+.workflow-details>details{padding:10px 0;border-bottom:1px solid #e5e9ef}
+.workflow-details summary,.workflow-reading summary{cursor:pointer;overflow-wrap:anywhere;font-size:14px}
+.workflow-details{min-width:0;overflow-wrap:anywhere}
+.workflow-modal [role=alert],.workflow-details [role=alert]{color:#ab2424}
+@media(max-width:640px){.workflow-modal{padding:16px}.workflow-panel-toolbar{align-items:stretch;flex-direction:column}.workflow-panel-toolbar label{min-width:0;width:100%}.workflow-panel-toolbar button{align-self:flex-start;min-height:36px}}

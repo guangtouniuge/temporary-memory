@@ -1,16 +1,34 @@
 import { createAuth, requestAccount, workspacePath, roles } from './auth.mjs'
+import { createXiaoqingwaClient } from './xiaoqingwa-client.mjs'
+import {createNewsPublishing} from './news-publishing.mjs'
+import {createAutoPublishPlans} from './auto-publish-plans.mjs'
+import {createMediaCatalog} from './media-catalog.mjs'
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 import { resolveCurrentUser, resolveProjectScope, runInProjectScope, currentProjectScope, projectDirectory, assertProjectFile, assertGalleryReference, assertStateKey, stampOwnedRows, validateGenerationScope, visibleProjectAccounts, scopeError } from './project-scope.mjs'
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { researchProvider } from './provider-research.mjs'
+import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'node:fs'
+import { stateCapacity, directoryBytes } from './resource-capacity.mjs'
 import { basename, resolve } from 'node:path'
 import { buildIsolatedEditor, parseEditorArticle, selectTemplate, templateNames } from './skill-editor.mjs'
 import { runWritingEngine, writingRelease } from './writing-engine.mjs'
-import { planBatchTopics, topicHistory } from './batch-editor.mjs'
+import { canResumeWritingRelease } from './writing-release.mjs'
+import { writingDepth, articleLength } from './writing-depth.mjs'
+import { topicHistory, freshArticlePlans } from './batch-editor.mjs'
+import { prepareAgentBatch, understandProject } from './agents-workflow.mjs'
+import { getUnderstanding, storeUnderstanding } from './project-understanding.mjs'
 import { articleHtml } from './article-format.mjs'
 import { JobJournal } from './job-journal.mjs'
+import { distillSelectionTerms, distillationCount } from './keyword-distillation.mjs'
+import { expandBusinessScenes, createSceneRequests } from './business-scenes.mjs'
+import { articleSceneImages, generateSceneImage } from './volcengine-images.mjs'
 import { modelRequestOptions } from './model-request.mjs'
+import { modelResponseFailure } from './model-response.mjs'
+import { priceMedia } from './billing-pricing.mjs'
 
 const PORT = Number(process.env.GEO_API_PORT || 8787)
+const distillationRuns = new Map()
+const sceneRequests = createSceneRequests()
 
 loadEnvFile(resolve(process.cwd(), '.env.local'))
 loadEnvFile(resolve(process.cwd(), '.env'))
@@ -39,6 +57,22 @@ function json(res, status, payload) {
   res.end(JSON.stringify(payload))
 }
 
+function html(res, status, body) {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+  })
+  res.end(String(body || ''))
+}
+
+function javascript(res, status, body) {
+  res.writeHead(status, {
+    'Content-Type': 'application/javascript; charset=utf-8',
+    'Cache-Control': 'no-store',
+  })
+  res.end(String(body || ''))
+}
+
 async function readJson(req) {
   const chunks = []
   let size = 0
@@ -52,12 +86,30 @@ async function readJson(req) {
   try { return raw ? JSON.parse(raw) : {} } catch { throw Object.assign(new Error('JSON格式错误'), { status: 400 }) }
 }
 
-function safeFileName(name) {
-  return String(name || 'GEO成品文章')
+function trimFileNameBytes(value, maxBytes = 120) {
+  let output = ''
+  let bytes = 0
+  for (const char of String(value || '')) {
+    const next = Buffer.byteLength(char)
+    if (bytes + next > maxBytes) break
+    output += char
+    bytes += next
+  }
+  return output
+}
+
+function safeFileName(name, maxBytes = 120) {
+  const cleaned = String(name || 'GEO成品文章')
     .replace(/[\\/:*?"<>|]/g, '')
     .replace(/\s+/g, '')
     .replace(/^\.+$/, '')
-    .slice(0, 80) || 'GEO成品文章'
+  return trimFileNameBytes(cleaned, maxBytes) || 'GEO成品文章'
+}
+
+function publicErrorMessage(error) {
+  if (error?.code === 'ENAMETOOLONG') return '文件名过长，系统已限制新文件名长度，请刷新后重试'
+  if (error?.code === 'ENOENT') return '文件不存在或已被清理，请刷新后重试'
+  return error?.message || '服务异常'
 }
 
 function localDate() {
@@ -240,17 +292,20 @@ function stateFilePath() {
 }
 
 function readAppState() {
+  if(!currentProjectScope().legacy)auth.recoverProjectFiles(currentProjectScope().projectId)
   const filePath = stateFilePath()
   if (!existsSync(filePath)) return {}
   try {
     return JSON.parse(readFileSync(filePath, 'utf8'))
   } catch {
-    return {}
+    throw scopeError('项目资料读取失败，已停止保存以保护原有数据',503)
   }
 }
 
 function writeAppState(state) {
-  writeFileSync(stateFilePath(), JSON.stringify(state, null, 2), 'utf8')
+  const path=stateFilePath()
+  writeFileSync(`${path}.tmp`, JSON.stringify(state, null, 2), {encoding:'utf8',flush:true})
+  renameSync(`${path}.tmp`,path)
 }
 
 function getStateValue(key) {
@@ -262,8 +317,17 @@ function getStateValue(key) {
 function setStateValue(key, value) {
   const state = readAppState()
   state[key] = stampOwnedRows(key, value)
-  writeAppState(state)
+  if(!currentProjectScope().legacy) {
+    const file=stateFilePath(),oldBytes=existsSync(file)?readFileSync(file).length:0
+    const usage={storageMB:ownedStorageAfter(Buffer.byteLength(JSON.stringify(state,null,2))-oldBytes)}
+    if(['geo.projectRows','geo.keywordRows','geo.keywordLibraryRows','geo.questionRows'].includes(key))Object.assign(usage,stateCapacity(state))
+    auth.persistProjectFiles(currentProjectScope().projectId,usage,[{path:file,data:JSON.stringify(state,null,2)}])
+  } else writeAppState(state)
   return state[key]
+}
+
+function ownedStorageAfter(delta) {
+  return Math.ceil((directoryBytes(resolve(projectDirectory('data'),'..'))+delta)/1048576)
 }
 
 function getStateArray(key) {
@@ -290,6 +354,7 @@ function persistArticleJobProgress(job, body, taskName, batchId) {
           error: job.error || (job.failed ? `${job.failed}篇接口无正文` : '-'),
           status: job.status === 'done' ? '已生成' : job.status === 'failed' ? '待生成' : '生成中',
           batchId,
+          jobId: job.id,
           time: body?.batchLabel || task.time,
         }
       : task,
@@ -322,30 +387,17 @@ function markdownToWordHtml(markdown) {
 
 function buildArticleExportContent(articles, body, format) {
   const markdown = articles
-    .map((article, index) => [
-      `# 第${index + 1}篇：${article.title}`,
-      '',
-      `- 归属品牌：${article.project || body.brand || ''}`,
-      `- 推荐词：${article.brand || ''}`,
-      `- 核心词：${article.keyword || ''}`,
-      `- 字数：${article.words || ''}字`,
-      `- 生成来源：${article.generationSource || '未记录'}`,
+    .map((article) => [
+      `# ${article.title}`,
       '',
       article.body || '当前文章暂无完整正文。',
     ].join('\n'))
     .join('\n\n---\n\n')
   if (format !== 'doc') return markdown
 
-  const bodyHtml = articles.map((article, index) => `
+  const bodyHtml = articles.map((article) => `
     <section class="article">
-      <h1>第${index + 1}篇：${escapeHtml(article.title)}</h1>
-      <div class="meta">
-        <p>归属品牌：${escapeHtml(article.project || body.brand || '')}</p>
-        <p>推荐词：${escapeHtml(article.brand || '')}</p>
-        <p>核心词：${escapeHtml(article.keyword || '')}</p>
-        <p>字数：${escapeHtml(article.words || '')}字</p>
-        <p>生成来源：${escapeHtml(article.generationSource || '未记录')}</p>
-      </div>
+      <h1>${escapeHtml(article.title)}</h1>
       <div class="content">${markdownToWordHtml(article.body || '当前文章暂无完整正文。')}</div>
     </section>
   `).join('<div class="page-break"></div>')
@@ -364,8 +416,6 @@ function buildArticleExportContent(articles, body, format) {
     img { max-width: 520px; height: auto; }
     table { border-collapse: collapse; width: 100%; }
     th, td { border: 1px solid #d1d5db; padding: 6pt; text-align: left; }
-    .meta { color: #4b5563; font-size: 10.5pt; margin-bottom: 18pt; }
-    .meta p { margin: 0 0 2pt; }
     .article { margin-bottom: 24pt; }
     .page-break { page-break-after: always; }
   </style>
@@ -392,10 +442,12 @@ function exportArticles(body) {
   const format = body?.format === 'doc' ? 'doc' : 'md'
   const exportDir = projectDirectory('exports')
   mkdirSync(exportDir, { recursive: true })
-  const fileName = `${safeFileName(body.filePrefix)}_${localDate()}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}.${format}`
+  const fileName = `${safeFileName(body.filePrefix, 96)}_${localDate()}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}.${format}`
   const filePath = resolve(exportDir, fileName)
   const content = buildArticleExportContent(articles, body, format)
-  writeFileSync(filePath, content, 'utf8')
+  const persist=()=>writeFileSync(filePath,content,{encoding:'utf8',flush:true})
+  if(currentProjectScope().legacy)persist()
+  else auth.persistProjectFiles(currentProjectScope().projectId,{storageMB:ownedStorageAfter(Buffer.byteLength(content))},[{path:filePath,data:content}])
   return {
     ok: true,
     fileName,
@@ -414,15 +466,18 @@ function uploadGalleryFiles(body) {
   assertProjectFile(resolve(uploadDir, 'upload-check'))
   mkdirSync(uploadDir, { recursive: true })
   const savedFiles = []
+  const prepared=[]
   for (const file of files) {
     const originalName = safeFileName(file?.name || `image-${Date.now()}.png`)
     const match = String(file?.dataUrl || '').match(/^data:([^;]+);base64,(.+)$/)
-    if (!match) continue
+    if (!match) return {ok:false,status:400,error:'图片格式无法保存'}
     if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(match[1])) return { ok: false, status: 400, error: '仅支持PNG、JPEG、GIF、WebP图片' }
+    const data = Buffer.from(match[2], 'base64')
+    if (data.length > 16 * 1024 * 1024) return { ok: false, status: 413, error: `单张图片超过16MB，请先压缩后上传：${originalName}` }
     const ext = originalName.includes('.') ? '' : match[1].includes('jpeg') ? '.jpg' : match[1].includes('png') ? '.png' : '.img'
     const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}_${originalName}${ext}`
     const filePath = resolve(uploadDir, fileName)
-    writeFileSync(filePath, Buffer.from(match[2], 'base64'))
+    prepared.push({filePath,data})
     savedFiles.push({
       name: file?.name || fileName,
       path: `/api/gallery/file?file=${encodeURIComponent(filePath)}`,
@@ -430,6 +485,14 @@ function uploadGalleryFiles(body) {
     })
   }
   if (!savedFiles.length) return { ok: false, status: 400, error: '图片格式无法保存' }
+  const persist=()=>{
+    const written=[]
+    try {
+      for(const item of prepared) {writeFileSync(item.filePath,item.data,{flag:'wx',flush:true});written.push(item.filePath)}
+    } catch(error) {for(const file of written)unlinkSync(file);throw error}
+  }
+  if(currentProjectScope().legacy)persist()
+  else auth.persistProjectFiles(currentProjectScope().projectId,{storageMB:ownedStorageAfter(prepared.reduce((n,f)=>n+f.data.length,0))},prepared.map(f=>({path:f.filePath,data:f.data})))
   return { ok: true, files: savedFiles }
 }
 
@@ -449,13 +512,23 @@ function parseGalleryImageItems(galleries = []) {
 function insertGalleryImagesIntoArticle(articleBody, galleries = []) {
   const source = String(articleBody || '').trim()
   if (!source || /!\[[^\]]*\]\([^)]+\)/.test(source)) return { body: source, imagePaths: [] }
-  const images = parseGalleryImageItems(galleries).slice(0, 2)
+  const galleryImages = parseGalleryImageItems(galleries)
+  const seed = `${source.slice(0, 240)}:${galleryImages.map(image => image.src).join('|')}`
+  let hash = 2166136261
+  for (let i = 0; i < seed.length; i += 1) {
+    hash ^= seed.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  const start = galleryImages.length ? Math.abs(hash) % galleryImages.length : 0
+  const images = galleryImages.length > 2
+    ? [0, 1].map(offset => galleryImages[(start + offset) % galleryImages.length])
+    : galleryImages.slice(0, 2)
   if (!images.length) return { body: source, imagePaths: [] }
   const blocks = source.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean)
   if (blocks.length < 3) {
     return {
-      body: `${source}\n\n![${images[0].label}](${images[0].src})`,
-      imagePaths: [images[0].src],
+      body: `${source}\n\n${images.map(image=>`![${image.label}](${image.src})`).join('\n\n')}`,
+      imagePaths: images.map(image=>image.src),
     }
   }
   const firstHeading = blocks.findIndex(block => /^#{1,6}\s/.test(block))
@@ -484,6 +557,7 @@ function configured(name) {
 function statusPayload() {
   const activeModelBaseUrl = process.env.MODEL_BASE_URL || process.env.QWEN_BASE_URL || ''
   const activeModelName = process.env.MODEL_NAME || process.env.QWEN_MODEL || ''
+  const platformConfigured = configured('MODEL_API_KEY') && configured('MODEL_BASE_URL') && configured('MODEL_NAME')
   return {
     qwen: {
       configured: configured('QWEN_API_KEY') && configured('QWEN_BASE_URL') && configured('QWEN_MODEL'),
@@ -494,7 +568,7 @@ function statusPayload() {
       configured: Boolean((process.env.MODEL_API_KEY || process.env.QWEN_API_KEY) && activeModelBaseUrl && activeModelName),
       baseUrl: activeModelBaseUrl,
       model: activeModelName,
-      source: process.env.MODEL_API_KEY ? '通用模型配置' : '通义兼容配置',
+      source: platformConfigured ? '总后台通用模型配置' : '通义兼容配置',
     },
     keyword5118: {
       configured: configured('KEYWORD_5118_KEY'),
@@ -513,16 +587,32 @@ function statusPayload() {
         !configured('XIAOQINGWA_ENDPOINT') && '小青蛙发布接口地址',
       ].filter(Boolean),
     },
+    meiticaigou: {
+      installed: configured('MEITICAIGOU_APP_KEY') && configured('MEITICAIGOU_BASE_URL'),
+      baseUrl: configured('MEITICAIGOU_BASE_URL') ? process.env.MEITICAIGOU_BASE_URL : 'http://39.108.71.152:8990',
+      missing: [
+        !configured('MEITICAIGOU_APP_KEY') && '媒体采购网app_key',
+        !configured('MEITICAIGOU_BASE_URL') && '媒体采购网接口地址',
+      ].filter(Boolean),
+    },
     oss: {
       configured: configured('ALIYUN_OSS_ACCESS_KEY') && configured('ALIYUN_OSS_ACCESS_SECRET') && configured('ALIYUN_OSS_BUCKET'),
     },
   }
 }
 
-async function callQwen(messages, temperature = 0.78, responseFormat) {
-  const apiKey = process.env.MODEL_API_KEY || process.env.QWEN_API_KEY
-  const baseUrl = process.env.MODEL_BASE_URL || process.env.QWEN_BASE_URL
-  const model = process.env.MODEL_NAME || process.env.QWEN_MODEL
+async function callQwen(messages, temperature = 0.78, responseFormat, providerKind = 'textModel') {
+  let provider = null
+  try { provider = auth?.providerConfig(currentProjectScope().projectId, providerKind) } catch {}
+  const modelEnv = provider ? {
+    ...process.env,
+    MODEL_API_KEY: provider.apiKey,
+    MODEL_BASE_URL: provider.baseUrl,
+    MODEL_NAME: provider.model,
+  } : process.env
+  const apiKey = modelEnv.MODEL_API_KEY || modelEnv.QWEN_API_KEY
+  const baseUrl = modelEnv.MODEL_BASE_URL || modelEnv.QWEN_BASE_URL
+  const model = modelEnv.MODEL_NAME || modelEnv.QWEN_MODEL
   if (!apiKey || !baseUrl || !model) {
     return { ok: false, error: '大模型接口未配置，请先在服务器.env.local填写MODEL_API_KEY、MODEL_BASE_URL、MODEL_NAME，或继续使用QWEN_API_KEY、QWEN_BASE_URL、QWEN_MODEL。' }
   }
@@ -553,7 +643,7 @@ async function callQwen(messages, temperature = 0.78, responseFormat) {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        ...modelRequestOptions(process.env, temperature, responseFormat),
+        ...modelRequestOptions(modelEnv, temperature, responseFormat),
         messages: guardedMessages,
       }),
     })
@@ -566,7 +656,17 @@ async function callQwen(messages, temperature = 0.78, responseFormat) {
       }
       return { ok: false, error: message }
     }
-    const content = data?.choices?.[0]?.message?.content || ''
+    const failure = modelResponseFailure(data)
+    if (failure) {
+      // Keep diagnostics free of prompts, credentials and generated content.
+      console.warn('[model-response]', JSON.stringify({ model, attempt: attempt + 1, status: response.status, finishReason: data?.choices?.[0]?.finish_reason || null, hasChoices: Array.isArray(data?.choices), hasReasoning: Boolean(data?.choices?.[0]?.message?.reasoning_content), retryable: failure.retryable }))
+      if (failure.retryable && attempt < maxAttempts - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1200 * (attempt + 1)))
+        continue
+      }
+      return { ok: false, code: failure.code, error: failure.retryable ? `${failure.error}，已尝试${attempt + 1}次；已完成的写作步骤仍保留，可稍后继续任务。` : failure.error }
+    }
+    const content = data.choices[0].message.content
     return { ok: true, content, raw: data }
     } catch (error) {
       const message = error?.name === 'AbortError' ? '模型接口生成超时，请降低单篇字数或稍后重试。' : error?.message || '模型接口调用失败。'
@@ -6666,48 +6766,18 @@ function buildFreeFullArticlePrompt(payload, title, editorOutline = '') {
   ].join('\n')
 }
 
-async function generateFreeWritingArticle(payload, log = () => {}) {
+async function generateFreeWritingArticle(payload, log = () => {}, workflowOptions = {}) {
   return runWritingEngine(payload, {
+    ...workflowOptions,
+    onUnderstanding: saveProjectUnderstanding,
     callModel: callQwen, date: currentNewsMonthLabel(),
     model: process.env.MODEL_NAME || process.env.QWEN_MODEL || 'configured-model', log,
   })
 }
 
-async function legacyGenerateFreeWritingArticle(payload, log = () => {}) {
-  log(`资料调用写作启动：${PROMPT_STACK_VERSION}`)
-  const fallbackTitle = payload?.plan?.title || payload?.plan?.question || `${payload?.packet?.coreKeyword || payload?.project?.coreKeyword || ''}文章`
-  let title = ''
-  if (payload?.plan?.lockTitle && payload?.plan?.title) {
-    title = cleanFreeArticleTitle(payload.plan.title, fallbackTitle)
-    log(`标题已按计划卡锁定：${title}`)
-  } else {
-    const titleResult = await callQwen([
-      { role: 'system', content: freeWritingSystemMessage() },
-      { role: 'user', content: buildFreeTitlePrompt(payload) },
-    ], 0.52)
-    title = cleanFreeArticleTitle(titleResult.ok ? titleResult.content : '', fallbackTitle)
-  }
-  log(`标题已锁定：${title}`)
-  log('skill编辑稿生产启动：按六段文章工序生成')
-  const result = await generateCleanArticleByModules(payload, title, log)
-  if (!result.ok || !String(result.body || '').trim()) {
-    return { ok: false, error: result.error || '模型接口未返回正文', body: result.body || '' }
-  }
-  const sceneContext = articleSceneContext(
-    payload?.plan?.industryScene || payload?.packet?.industryScene || payload?.project?.industry || '',
-    payload?.project || {},
-    payload?.packet?.coreKeyword || payload?.project?.coreKeyword || payload?.coreKeyword || '',
-  )
-  const cleanedBody = cleanProductionArticleBody(result.body)
-  const body = stripFreeArticleTitle(
-    normalizeArticleBodyForTemplate(removeOffSceneSoftwareTerms(cleanedBody, sceneContext), payload),
-    title,
-  )
-  log(`skill编辑稿生产完成：${countChinese(body)}字`)
-  return { ok: true, title, body }
-}
 
-async function generateArticleFromPlan(body, log = () => {}) {
+async function generateArticleFromPlan(body, log = () => {}, workflowOptions = {}) {
+  if(body.packet?.imageSource==='ai'&&!workflowOptions.articleId)return {ok:false,error:'AI配图请通过生成任务执行，以保留图片重试进度'}
   if (Number(body?.count || 1) !== 1 || !body?.plan) {
     return {
       ok: false,
@@ -6716,38 +6786,42 @@ async function generateArticleFromPlan(body, log = () => {}) {
     }
   }
   const nextBody = { ...body, plan: { ...body.plan } }
-  const firstDraft = await generateFreeWritingArticle(nextBody, log)
+  const firstDraft = await generateFreeWritingArticle(nextBody, log, workflowOptions)
   let rawBody = firstDraft.ok ? firstDraft.body : ''
   if (!rawBody) {
     const reason = firstDraft.error || '接口无内容'
     log(`正文API未返回内容：${reason}`)
-    const failedPreview = firstDraft.body || ''
-    return {
-      ok: true,
-      articles: [{
-        id: `API-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-        title: nextBody.plan.title || nextBody.plan.question || `${body.packet?.coreKeyword || body.project?.coreKeyword || ''}文章`,
-        angle: nextBody.plan.angle || nextBody.plan.direction || '自由写作',
-        keyword: body.packet?.coreKeyword || body.project?.coreKeyword || '',
-        status: '生成异常',
-        words: String(countChinese(failedPreview)),
-        brand: body.project?.recommendWord || body.project?.brand || '',
-        project: body.project?.name || '',
-        batchId: body.batchId || '',
-        taskName: body.taskName || body.task?.name || '',
-        batchLabel: body.batchLabel || '',
-        body: `接口未返回正文。\n\n失败原因：${reason}\n\n返回预览：\n\n${failedPreview}`,
-        apiIssues: [`正文API未返回内容：${reason}`],
-        apiRepairLog: [],
-        generationSource: 'API资料调用未返回',
-      }],
-    }
+    return { ok: false, error: reason }
   }
   const fallbackTitle = nextBody.plan.title || nextBody.plan.question || `${body.packet?.coreKeyword || body.project?.coreKeyword || ''}文章`
   const title = firstDraft.title || extractFreeArticleTitle(rawBody, fallbackTitle)
   // The sealed engine has already separated the title from the original body.
-  const galleryResult = insertGalleryImagesIntoArticle(rawBody, body?.packet?.galleries || [])
+  let galleries=body?.packet?.galleries || []
+  if(body.packet?.imageSource==='ai') {
+    const imageProvider = auth.providerConfig(currentProjectScope().projectId, 'imageModel')
+    const state=workflowOptions.state || {stages:{}}
+    const images=await articleSceneImages({project:body.project,title,body:rawBody,scene:body.plan.businessScene||body.plan.industryScene,
+      generate:imageProvider ? prompt => generateSceneImage(prompt,{apiKey:imageProvider.apiKey,model:imageProvider.model,fetchImpl:(url,options)=>fetch(imageProvider.baseUrl || url,options)}) : generateSceneImage,
+      billing:{reserve:()=>auth.reserveImages(currentProjectScope().projectId,workflowOptions.articleId),settle:(id,success)=>auth.settleImages(id,success)},
+      articleId:workflowOptions.articleId || body.requestId,state,saveState:async()=>workflowOptions.save?.(),log,
+      findSaved:key=>{const row=getStateArray('geo.galleryRows').find(r=>r[0]===body.project.name&&r[8]===key);return row?{path:row[5]}:null},
+      saveImage:(key,file,index)=>{
+        const filePath=resolve(projectDirectory('uploads'),'ai',`${key}.${file.ext}`);assertProjectFile(filePath)
+        const path=`/api/gallery/file?file=${encodeURIComponent(filePath)}`
+        const appState=readAppState(),statePath=stateFilePath(),previous=existsSync(statePath)?readFileSync(statePath).length:0
+        appState['geo.galleryRows']=stampOwnedRows('geo.galleryRows',[[body.project.name,'AI场景图','正文配图','AI生成场景示意，非实拍',new Date().toISOString(),path,`${title}-场景${index+1}`,'ai',key],...(appState['geo.galleryRows']||[])])
+        const data=JSON.stringify(appState,null,2)
+        auth.persistProjectFiles(currentProjectScope().projectId,{storageMB:ownedStorageAfter(file.data.length+Buffer.byteLength(data)-previous)},[{path:filePath,data:file.data},{path:statePath,data}])
+        return {path}
+      },
+    })
+    galleries=images.map(image=>`文章配图（文件：${image.path}）`)
+    rawBody=rawBody.replace(/!\[[^\]]*\]\([^)]+\)/g,'').replace(/<img\b[^>]*>/gi,'')
+  }
+  const galleryResult = insertGalleryImagesIntoArticle(rawBody, galleries)
   rawBody = galleryResult.body
+  const visibleCharacters = articleLength(title, rawBody)
+  if (visibleCharacters > writingDepth(nextBody).max) return { ok: false, error: '配图后可见文字超出本篇长度限制，请调整图片说明后重试。' }
   log(`API自由写作完成：${countChinese(rawBody)}字`)
   const article = {
     id: `API-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
@@ -6755,7 +6829,7 @@ async function generateArticleFromPlan(body, log = () => {}) {
     angle: nextBody.plan.angle || nextBody.plan.direction || '自由写作',
     keyword: body.packet?.coreKeyword || body.project?.coreKeyword || '',
     status: '已生成',
-    words: String(countChinese(rawBody)),
+    words: String(visibleCharacters),
     brand: body.project?.recommendWord || body.project?.brand || '',
     project: body.project?.name || '',
     batchId: body.batchId || '',
@@ -6763,6 +6837,9 @@ async function generateArticleFromPlan(body, log = () => {}) {
     batchLabel: body.batchLabel || '',
     body: rawBody,
     imagePaths: galleryResult.imagePaths,
+    imageSource: body.packet?.imageSource || 'imported',
+    writingDepth: firstDraft.writingDepth,
+    visibleCharacters,
     production: firstDraft.production,
     editorialBrief: firstDraft.editorialBrief,
     apiIssues: [],
@@ -6774,6 +6851,25 @@ async function generateArticleFromPlan(body, log = () => {}) {
 
 const articleJobs = new Map()
 const jobJournal = new JobJournal()
+
+function saveProjectUnderstanding(payload, value) {
+  const rows = getStateArray('geo.projectUnderstandingRows')
+  const existing = getUnderstanding(payload, rows)
+  setStateArray('geo.projectUnderstandingRows', storeUnderstanding(payload, value, rows, existing.record?.notes ?? existing.previous?.notes ?? payload.understandingNotes ?? ''))
+}
+
+function generationInput(body) {
+  const input = validateGenerationScope(body, getStateValue)
+  if(input.packet.imageSource==='ai'&&(!process.env.ARK_API_KEY||!process.env.ARK_IMAGE_MODEL))throw scopeError('火山引擎生图尚未配置，请联系管理员',503)
+  if(input.packet.imageSource==='ai'&&process.env.ARK_IMAGE_ENABLED==='false')throw scopeError('火山账号尚未开通Seedream生图模型，请管理员开通后启用；也可选择自有导入图片',503)
+  if(input.packet.imageSource==='ai')auth.checkImageStorage(currentProjectScope().projectId)
+  if(body.task?.imageSource==='imported'&&input.packet.galleries.length<2)throw scopeError('自有导入图库至少需要两张图片，请先上传',400)
+  const depth = writingDepth(input)
+  input.task = { ...input.task, writingDepth: depth.id }
+  input.packet.writingDepth = depth.id
+  const { record, previous } = getUnderstanding(input, getStateArray('geo.projectUnderstandingRows'))
+  return { ...input, projectUnderstanding: record?.value, understandingNotes: record?.notes || previous?.notes || '' }
+}
 
 function publicJob(job) {
   const completedByArticles = Math.min(job.articles.length, job.total)
@@ -6790,6 +6886,14 @@ function publicJob(job) {
     logs: job.logs.slice(-80),
     error: job.error,
     promptVersion: PROMPT_STACK_VERSION,
+    workflowStage: job.workflow?.current || '',
+    project: job.jobProject || job.articles?.[0]?.project || '',
+    plans: (job.plans || []).map(plan => ({ articleType: plan.articleType, writingSceneMode: plan.writingSceneMode, editorialBrief: plan.editorialBrief })),
+    materialScope: job.materialScope,
+    workflowSteps: [...Object.entries(job.workflow?.stages || {}).map(([key, stage]) => ({
+      key, label: key.split(':')[0], status: stage.status, error: stage.error,
+      value: /^(项目理解|范文理解|单篇编辑|标题编辑):/.test(key) ? stage.value : undefined,
+    })), ...Object.entries(job.workflow?.imageSlots || {}).map(([key,slot])=>({key:`图片:${key}`,label:'AI配图',status:slot.status==='sending'?'running':slot.status==='uncertain'?'failed':slot.status}))],
   }
 }
 
@@ -6805,103 +6909,54 @@ function buildServerArticlePlans(body) {
   const packet = body.packet || {}
   const task = body.task || {}
   const count = Math.min(Math.max(Number.parseInt(body.count, 10) || 1, 1), 100)
-  const mode = task.writingSceneMode || packet.writingSceneMode || '按自己行业写'
+  const mode = task.writingSceneMode || packet.writingSceneMode || 'AI场景'
   return Array.from({ length: count }, (_, index) => {
     const template = selectTemplate(task.articleType ?? packet.articleType, index)
     return {
-      articleType: template.name,
-      direction: template.name,
+      articleType: task.articleType || packet.articleType ? template.name : '',
+      direction: task.articleType || packet.articleType ? template.name : '',
       planIndex: index,
       writingSceneMode: mode,
-      industryScene: mode === '按实际场景写' ? `${project.industry || packet.coreKeyword}客户行业自动拓展（第${index + 1}篇）` : project.industry,
+      sceneCity: packet.sceneCity,
+      sceneIndustry: packet.sceneIndustry,
+      writingDepth: task.writingDepth || packet.writingDepth || 'deep',
+      industryScene: mode === '按实际场景写' ? packet.businessScenes?.[index % packet.businessScenes.length] : mode === '手动场景' ? packet.sceneIndustry : mode === 'AI场景' ? undefined : project.industry,
+      businessScene: mode === '按实际场景写' ? packet.businessScenes?.[index % packet.businessScenes.length] : undefined,
       lockTitle: false,
       question: packet.questions?.[index % (packet.questions?.length || 1)] || packet.coreKeyword || project.coreKeyword,
     }
   })
 }
 
-function legacyBuildServerArticlePlans(body) {
-  const project = body?.project || {}
-  const packet = body?.packet || {}
-  const task = body?.task || {}
-  const core = packet?.coreKeyword || project?.coreKeyword || body?.coreKeyword || ''
-  const count = Math.min(Math.max(Number.parseInt(body?.count, 10) || 1, 1), 100)
-  const articleTypes = parseArticleTypes(task.articleType || packet.articleType || '榜单推荐')
-  const writingSceneMode = task.writingSceneMode || packet.writingSceneMode || '按自己行业写'
-  const userQuestions = parseEditorLines(task.userQuestions || packet.userQuestions)
-  const providerList = task.providerList || packet.providerList || ''
-  const mainReason = task.mainReason || packet.mainReason || ''
-  const unfitScenario = task.unfitScenario || packet.unfitScenario || ''
-  const titlePreference = task.titlePreference || packet.titlePreference || ''
-  const forbiddenContent = task.forbiddenContent || packet.forbiddenContent || ''
-  const questions = Array.isArray(packet?.questions) && packet.questions.length
-    ? [...userQuestions, ...packet.questions]
-    : [`${core}哪家靠谱`, `${core}怎么选服务商`, `${core}推荐哪家公司`, `${core}口碑怎么核验`]
-  const keywords = Array.isArray(packet?.keywords) ? packet.keywords.filter((word) => word && word !== core) : []
-  const galleries = Array.isArray(packet?.galleries) ? packet.galleries : []
-  const scenes = [
-    `${project?.city || '西安'}企业采购现场调查`,
-    `${project?.city || '西安'}本地服务商测评`,
-    `${project?.city || '西安'}企业口碑核验`,
-    `${project?.city || '西安'}低价服务避坑`,
-    `${project?.city || '西安'}AI答案回看复盘`,
-  ]
-  const heads = [
-    ['用户问题为什么变具体', '普通发稿为什么失灵', '交付证据怎么核验', '推荐样本如何判断'],
-    ['报价之外先看服务边界', '口碑截图为什么不够', '答案回看怎么证明价值', '候选样本如何进入名单'],
-    ['本地企业为什么追问靠谱', '低价套餐哪里容易失真', '资料口径如何影响推荐', '风险边界需要提前说清'],
-    ['榜单不能只看排名', '测评要回到交付记录', '服务商差异怎么被看见', '企业下一步如何复盘'],
-  ]
-  return Array.from({ length: count }, (_, index) => {
-    const question = questions[index % questions.length] || `${core}哪家靠谱`
-    const articleType = articleTypes[index % articleTypes.length] || '榜单推荐'
-    const industryScene = resolveWritingScene(project, packet, { ...task, writingSceneMode }, index)
-    const sceneContext = articleSceneContext(industryScene, project, core)
-    const titlePool = localTitleCandidates(body, {
-      core,
-      city: project?.city || '西安',
-      articleType,
-      industry: industryScene,
-      index: index + 1,
-    })
-    const title = titlePool[index % titlePool.length]
-    const rotatedKeywords = keywords.length
-      ? [keywords[index % keywords.length], keywords[(index + 1) % keywords.length], keywords[(index + 2) % keywords.length]].filter(Boolean)
-      : []
-    return {
-      title,
-      question,
-      articleType,
-      writingSceneMode,
-      industryScene,
-      userQuestions: userQuestions.join('\n'),
-      providerList,
-      mainReason,
-      unfitScenario,
-      titlePreference,
-      forbiddenContent,
-      direction: articleType,
-      angle: sceneContext.readerScene || scenes[index % scenes.length],
-      scene: `${scenes[index % scenes.length]}：${sceneContext.readerScene}不是要看行业科普，而是要把客户真实痛点、样稿、服务清单和AI答案回看放到同一套口径里比较GEO服务商。`,
-      region: project?.city || '西安',
-      role: index % 2 ? '本地企业' : '企业负责人',
-      sectionHeads: heads[index % heads.length],
-      keywords: Array.from(new Set([core, ...rotatedKeywords])).join(' / '),
-      evidence: index % 2 ? '调用平台适配、问题库和内容版本记录' : '调用服务边界、实体一致性和答案回看依据',
-      image: '纯文字新闻稿',
-      status: '可生成',
-    }
-  })
-}
 
 function startArticleJob(body, recovered = null) {
+  if(!recovered && body.restartOf) {
+    const source=jobJournal.load(String(body.restartOf))
+    if(!source || source.job.projectId!==currentProjectScope().projectId || source.job.jobProject!==body.project?.name)throw scopeError('无法重新生成：原任务不属于当前品牌项目',403)
+    if(['queued','running'].includes(source.job.status))throw scopeError('原任务尚在运行，请等待完成或停止后再重新生成',409)
+  }
+  const requestKey=body.requestId||body.batchId
+  const replayId=requestKey?`JOB-${createHash('sha256').update(`${currentProjectScope().projectId}:${requestKey}`).digest('hex').slice(0,40)}`:null
+  const requestHash=createHash('sha256').update(JSON.stringify(body)).digest('hex')
+  if(!recovered && replayId) {
+    const previous=jobJournal.load(replayId)
+    if(previous) {
+      if(previous.job.deletedAt)throw scopeError('任务已删除，请新建任务',409)
+      if(previous.job.requestHash!==requestHash)throw scopeError('任务编号已用于其他生成内容',409)
+      return publicJob(previous.job)
+    }
+  }
+  const cachedNext = recovered && auth.articleResult(recovered.job.projectId, `${recovered.job.id}:${recovered.job.completed}`)
+  if(!currentProjectScope().legacy && !cachedNext && (!recovered || recovered.job.completed < recovered.plans.length))auth.checkArticleAccess(currentProjectScope().projectId)
   let plans = Array.isArray(body?.plans) && body.plans.length ? body.plans : body?.plan ? [body.plan] : buildServerArticlePlans(body)
+  if (!recovered) plans = freshArticlePlans(plans)
   const taskName = body?.taskName || body?.task?.name || `${body?.packet?.coreKeyword || body?.project?.coreKeyword || 'GEO'}新闻任务`
   const batchId = body?.batchId || `${body?.project?.name || 'GEO'}-${Date.now()}`
   const batchLabel = body?.batchLabel || new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
   if (plans.length > 100) throw new Error('单批最多100篇')
   const job = recovered?.job || {
-    id: `JOB-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    id: replayId||`JOB-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    requestHash,
     projectId: currentProjectScope().projectId,
     legacyScope: Boolean(currentProjectScope().legacy),
     status: 'queued',
@@ -6914,6 +6969,8 @@ function startArticleJob(body, recovered = null) {
     error: '',
     executionScope: currentProjectScope(),
     storageScope: `${currentProjectScope().projectId}:${body.project?.name || ''}`,
+    jobProject: body.project?.name || '',
+    materialScope: { knowledgeName: body.packet?.knowledgeName || '', sources: body.packet?.materialSources || [] },
   }
   if (recovered) plans = recovered.plans.length ? recovered.plans : plans
   body = recovered?.body || { ...body, batchId, batchLabel }
@@ -6929,19 +6986,48 @@ function startArticleJob(body, recovered = null) {
     appendJobLog(job, '后台任务启动：按单篇计划卡顺序生成')
     persistArticleJobProgress(job, body, taskName, batchId)
     try {
+      if(job.cancelRequested)throw new Error('任务已停止，可继续未完成的部分')
+      if(job.completed<plans.length && !auth.articleResult(job.projectId,`${job.id}:${job.completed}`))auth.reserveArticle(job.projectId,`${job.id}:${job.completed}`)
       appendJobLog(job, '正在安排本批选题：区分每篇中心问题和推荐论据')
-      if (!plans.every(plan => plan.editorialBrief)) plans = await planBatchTopics(body, plans, topicHistory(getStateArray('geo.articleRows'), body.project || {}), callQwen, message => appendJobLog(job, message))
+      job.workflow ||= { stages: {} }
+      const workflowOptions = {
+        state: job.workflow,
+        save: () => persistArticleJobProgress(job, body, taskName, batchId),
+        callModel: callQwen,
+        model: process.env.MODEL_NAME || process.env.QWEN_MODEL || 'configured-model',
+        date: currentNewsMonthLabel(),
+        log: message => appendJobLog(job, message),
+        onUnderstanding: saveProjectUnderstanding,
+      }
+      if (!plans.every(plan => plan.editorialBrief)) {
+        const history = topicHistory(getStateArray('geo.articleRows'), body.project || {})
+        const seen = new Set(history.filter(row => row.brief).map(row => JSON.stringify(row.brief)))
+        for (const row of jobJournal.topicHistory(job.storageScope, job.id)) {
+          const key = JSON.stringify(row.brief)
+          if (!seen.has(key)) { seen.add(key); history.push(row) }
+        }
+        plans = await prepareAgentBatch(body, plans, history, workflowOptions)
+      }
       job.plans = plans
       persistArticleJobProgress(job, body, taskName, batchId)
       appendJobLog(job, `选题稿单已完成：${plans.length}篇，开始按原模板逐篇写作`)
       for (let index = job.completed; index < plans.length; index += 1) {
+        if(job.cancelRequested)throw new Error('任务已停止，可继续未完成的部分')
         const plan = plans[index]
         appendJobLog(job, `第${index + 1}/${plans.length}篇启动：${plan.title || plan.question || '未命名计划卡'}`)
-        const result = await generateArticleFromPlan({ ...body, plan, count: 1, previousArticles: job.articles }, (message) => appendJobLog(job, `第${index + 1}篇：${message}`))
+        const billingKey = `${job.id}:${index}`
+        let result = auth.articleResult(job.projectId, billingKey)
+        const reservation = result ? null : auth.reserveArticle(job.projectId, billingKey)
+        try {
+          result ||= await generateArticleFromPlan({ ...body, plan, count: 1, previousArticles: topicHistory([...job.articles.slice().reverse(), ...getStateArray('geo.articleRows').filter(row => !job.articles.some(a => a.id === row.id))], body.project || {}) }, (message) => appendJobLog(job, `第${index + 1}篇：${message}`), { ...workflowOptions, articleId: `${job.id}:${index}` })
+          auth.settleArticle(reservation, Boolean(result.ok && result.articles?.length && result.articles.every(a=>a.body?.trim() && !a.apiIssues?.length)), result)
+        } catch(error) { auth.settleArticle(reservation,false); throw error }
         if (!result.ok) {
-          job.failed += 1
+          job.failed = 1
           appendJobLog(job, `第${index + 1}篇接口失败：${result.error || '未知错误'}`)
+          throw new Error(result.error || '当前写作工序未完成，进度已保存')
         } else {
+          job.failed = 0
           const article = stampOwnedRows('geo.articleRows', result.articles)[0]
           article.editorialBrief = plan.editorialBrief
           article.batchId = batchId
@@ -6959,12 +7045,14 @@ function startArticleJob(body, recovered = null) {
       appendJobLog(job, `任务完成：生成${job.passed}篇，接口无正文${job.failed}篇`)
       persistArticleJobProgress(job, body, taskName, batchId)
     } catch (error) {
+      auth.releaseArticleJob(job.projectId,job.id)
       job.status = 'failed'
       job.error = error instanceof Error ? error.message : '任务异常'
       appendJobLog(job, `任务异常：${job.error}`)
       persistArticleJobProgress(job, body, taskName, batchId)
     }
   }).catch(error => {
+    auth.releaseArticleJob(job.projectId,job.id)
     job.status = 'failed'
     job.error = error.message || '任务存储失败'
     appendJobLog(job, job.error)
@@ -6977,6 +7065,7 @@ function restoreArticleJobs() {
   for (const record of jobJournal.pending()) {
     runInProjectScope(record.job.executionScope, () => {
       if (record.version !== writingRelease.version) {
+        auth.releaseArticleJob(record.job.projectId,record.job.id)
         record.job.status = 'failed'
         record.job.error = '写作版本已变更，已保留成稿与稿单；请新建任务，避免同批混用版本'
         jobJournal.save(record)
@@ -6984,37 +7073,570 @@ function restoreArticleJobs() {
         persistArticleJobProgress(record.job, record.body, record.body.taskName || record.body.task?.name || '', record.body.batchId)
         return
       }
-      startArticleJob(record.body, record)
+      try { startArticleJob(record.body, record) } catch(error) {
+        auth.releaseArticleJob(record.job.projectId,record.job.id)
+        record.job.status='failed'
+        record.job.error=error.message
+        jobJournal.save(record)
+        articleJobs.set(record.job.id,record.job)
+      }
     })
   }
 }
 
 async function publishToMedia(body) {
-  if (body?.dryRun && configured('XIAOQINGWA_KEY') && configured('XIAOQINGWA_BASE_URL') && !configured('XIAOQINGWA_ENDPOINT')) {
-    return {
-      ok: true,
-      installed: true,
-      publishReady: false,
-      message: '小青蛙KEY和平台地址已安装；还缺发文接口地址，暂不能真实发布。',
+  if(body?.dryRun!==true)return {ok:false,status:409,error:'请从文章任务创建发布订单；直接投稿入口已关闭，避免漏扣费或重复投稿'}
+  if (!configured('XIAOQINGWA_KEY') || !configured('XIAOQINGWA_ENDPOINT')) {
+    return { ok: false, status: 501, error: '小青蛙接口尚未配置完整' }
+  }
+  const form = new FormData()
+  form.set('api_key', process.env.XIAOQINGWA_KEY)
+  const dryRun = body?.dryRun === true
+  const endpoint = dryRun
+    ? new URL('/api/media/media_list', process.env.XIAOQINGWA_BASE_URL).href
+    : process.env.XIAOQINGWA_ENDPOINT
+  if (dryRun) {
+    form.set('page', '1')
+    form.set('page_size', '1')
+  } else {
+    if (!body?.resource_id || !body?.title || !body?.content || !body?.third_id) {
+      return { ok: false, status: 400, error: '请明确选择媒体，并提供文章标题、正文和唯一投稿编号' }
+    }
+    for (const field of ['resource_id', 'title', 'content', 'remark', 'third_id']) {
+      form.set(field, String(body[field] || ''))
     }
   }
-  if (!configured('XIAOQINGWA_KEY') || !configured('XIAOQINGWA_ENDPOINT')) {
-    return { ok: false, status: 501, error: '小青蛙接口未配置完整：还需要发布接口地址、媒体列表接口和状态回查接口文档。' }
-  }
-  const response = await fetch(process.env.XIAOQINGWA_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: process.env.XIAOQINGWA_KEY,
-    },
-    body: JSON.stringify(body),
+  const response = await fetch(endpoint, {
+    method: 'POST', body: form, signal: AbortSignal.timeout(30000), redirect: 'error',
   })
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) return { ok: false, status: response.status, error: data?.message || '小青蛙发布接口调用失败', raw: data }
-  return { ok: true, data }
+  const data = await response.json().catch(() => null)
+  if (!response.ok || Number(data?.code) !== 1) {
+    return { ok: false, status: 502, error: '小青蛙接口未返回成功，请检查KEY权限或平台服务状态' }
+  }
+  return dryRun
+    ? { ok: true, installed: true, publishReady: true, message: '小青蛙连接成功，媒体列表读取正常；未提交投稿' }
+    : { ok: true, data: data.data }
 }
 
 const auth = createAuth({ json, readJson })
+const currentPriceFor = (resource, channel) => priceMedia(resource, channel, auth.pricingPolicy(currentProjectScope().projectId))
+const newsPublishing=createNewsPublishing({auth,readState:getStateArray,scope:currentProjectScope,readJson,json,priceFor:currentPriceFor})
+const autoPublishPlans=createAutoPublishPlans({
+  readState:getStateArray,
+  setTaskRows:value=>setStateArray('geo.taskRows',value),
+  setDistributionTasks:value=>setStateArray('geo.distributionTasks',value),
+  startGenerationTask:body=>startArticleJob(generationInput(body)),
+  dataDirectory:()=>projectDirectory('data'),
+  json,
+  readJson,
+})
+const mediaCatalog=createMediaCatalog()
+const DIAGNOSIS_INCLUSION_CENTS = 1100
+const DIAGNOSIS_REPORT_CENTS = 1300
+const diagnosisPlatformNames = { '1': 'DeepSeek', '2': '豆包', '3': '文心一言', '4': '智谱', '5': '腾讯元宝', '6': '纳米', '7': '通义千问', '8': 'Kimi' }
+
+const diagnosisClient = () => {
+  const custom = auth.providerConfig(currentProjectScope().projectId, 'xiaoqingwa')
+  return createXiaoqingwaClient({ baseUrl: custom?.baseUrl || process.env.XIAOQINGWA_BASE_URL, key: custom?.apiKey || process.env.XIAOQINGWA_KEY })
+}
+const trimText = (value, max = 500) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max)
+const firstText = (...values) => trimText(values.find(value => trimText(value)) || '')
+const firstFullText = (...values) => String(values.find(value => String(value || '').trim()) || '').trim()
+const reportIdKeys = new Set(['reportid', 'report_id', 'reportuuid', 'report_uuid', 'reportno', 'report_no'])
+function findDeepValue(value, acceptKey, depth = 0) {
+  if (!value || depth > 6) return ''
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findDeepValue(item, acceptKey, depth + 1)
+      if (found) return found
+    }
+    return ''
+  }
+  if (typeof value !== 'object') return ''
+  for (const [key, child] of Object.entries(value)) {
+    if (acceptKey(String(key).toLowerCase()) && String(child || '').trim()) return trimText(child, 160)
+    const found = findDeepValue(child, acceptKey, depth + 1)
+    if (found) return found
+  }
+  return ''
+}
+function reportIdFromPayload(...values) {
+  return firstText(...values.map(value => findDeepValue(value, key => reportIdKeys.has(key))))
+}
+function reportDownloadReady(download) {
+  const page = firstFullText(download?.html, download?.reportHtml)
+  if (page.length > 1000) return true
+  return Boolean(firstFullText(download?.pdf, download?.pdf_base64, download?.pdfBase64, download?.file).length > 1000 || firstText(download?.url, download?.download_url, download?.downloadUrl))
+}
+function reportScripts(page) {
+  return [...String(page || '').matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(match => match[1])
+}
+function reportPageWithExternalScripts(taskId, page) {
+  let index = 0
+  return String(page || '').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, () => {
+    const src = `/api/diagnosis/report-script?id=${encodeURIComponent(taskId)}&n=${index}`
+    index += 1
+    return `<script src="${src}"></script>`
+  })
+}
+function reportStatusInfo(result) {
+  const raw = trimText(result?.status || result?.data?.status || result?.state || result?.data?.state || result?.message || result?.msg || '报告生成中', 80)
+  const finished = /完成|已生成|成功|success|done|finish|complete|completed/i.test(raw) || Number(result?.status ?? result?.data?.status) === 2
+  const failed = /失败|异常|退回|退款|fail|error|reject/i.test(raw)
+  return { raw, finished, failed }
+}
+function safeUrl(value) {
+  const text = String(value || '').replace(/&quot;/g, '"').trim()
+  const match = text.match(/https?:\/\/[^\s"'<>]+/i)
+  if (!match) return ''
+  try {
+    const url = new URL(match[0])
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : ''
+  } catch {
+    return ''
+  }
+}
+function standardDiagnosisReportHtml(task) {
+  const results = Array.isArray(task.providerResults) ? task.providerResults : []
+  const collected = results.filter(item => Number(item?.result?.status) === 1).length
+  const failed = results.filter(item => item.refunded || Number(item?.result?.status) === 3).length
+  const total = results.length || (Array.isArray(task.platformNames) ? task.platformNames.length : 0)
+  const uncollected = Math.max(0, total - collected - failed)
+  const evidenceCount = results.filter(item => safeUrl(item?.result?.share_url) || safeUrl(item?.result?.img_url)).length
+  const collectedRate = total ? Math.round((collected / total) * 100) : 0
+  const evidenceRate = total ? Math.round((evidenceCount / total) * 100) : 0
+  const stableRate = total ? Math.round(((total - failed) / total) * 100) : 0
+  const score = total ? Math.max(0, Math.min(100, Math.round(collectedRate * 0.5 + evidenceRate * 0.3 + stableRate * 0.2))) : 0
+  const grade = score >= 80 ? '优秀' : score >= 60 ? '良好' : score >= 40 ? '待提升' : '需重点优化'
+  const brand = task.brand || task.input || 'GEO品牌'
+  const keywordText = firstText(task.keywords, task.keyword, task.question, results[0]?.result?.hit_word, '-')
+  const questionText = firstText(task.question, results[0]?.result?.question, `在主流AI平台搜索${keywordText}，是否能推荐${brand}？`)
+  const createdTime = task.createdAt ? new Date(task.createdAt).toLocaleString('zh-CN') : ''
+  const updatedTime = task.updatedAt ? new Date(task.updatedAt).toLocaleString('zh-CN') : createdTime
+  const reportUrl = task.id ? `/api/diagnosis/report-view?id=${encodeURIComponent(task.id)}` : ''
+  const statusClass = item => {
+    const status = Number(item?.result?.status)
+    if (status === 1) return 'ok'
+    if (status === 3 || item?.refunded) return 'bad'
+    return 'warn'
+  }
+  const platformIcon = name => escapeHtml(String(name || 'AI').trim().slice(0, 2) || 'AI')
+  const platformStatus = item => escapeHtml(item.statusLabel || diagnosisStatus(item.result || {}).label)
+  const modelCards = results.map(item => {
+    const result = item.result || {}
+    const share = safeUrl(result.share_url)
+    const image = safeUrl(result.img_url)
+    const cls = statusClass(item)
+    const name = escapeHtml(item.platformName || item.platform || 'AI模型')
+    return `<article class="model-card ${cls}">
+      <div class="model-top"><span class="model-icon">${platformIcon(item.platformName || item.platform)}</span><strong>${name}</strong></div>
+      <div class="model-status">${platformStatus(item)}</div>
+      <p>${escapeHtml(result.hit_word || keywordText || '按当前行业词进行可见度查询')}</p>
+      <div class="model-links">
+        ${share ? `<a href="${escapeHtml(share)}" target="_blank" rel="noopener noreferrer">对话证据</a>` : '<span>无对话链接</span>'}
+        ${image ? `<a href="${escapeHtml(image)}" target="_blank" rel="noopener noreferrer">截图证据</a>` : '<span>无截图</span>'}
+      </div>
+    </article>`
+  }).join('')
+  const rows = results.map((item, index) => {
+    const result = item.result || {}
+    const share = safeUrl(result.share_url)
+    const image = safeUrl(result.img_url)
+    const status = platformStatus(item)
+    const tone = statusClass(item)
+    return `<tr>
+      <td>${index + 1}</td>
+      <td><strong>${escapeHtml(item.platformName || item.platform || '-')}</strong></td>
+      <td><span class="pill ${tone}">${status}</span></td>
+      <td>${escapeHtml(result.question || task.question || '-')}</td>
+      <td>${escapeHtml(result.hit_word || '-')}</td>
+      <td>${share ? `<a href="${escapeHtml(share)}" target="_blank" rel="noopener noreferrer">查看对话</a>` : '-'}</td>
+      <td>${image ? `<a href="${escapeHtml(image)}" target="_blank" rel="noopener noreferrer">查看截图</a>` : '-'}</td>
+    </tr>`
+  }).join('')
+  const sourceRows = results.map((item, index) => {
+    const result = item.result || {}
+    const share = safeUrl(result.share_url)
+    const image = safeUrl(result.img_url)
+    const hasEvidence = share || image
+    return `<tr>
+      <td>${index + 1}</td>
+      <td><strong>${escapeHtml(item.platformName || item.platform || '-')}</strong></td>
+      <td>${escapeHtml(result.hit_word || keywordText || '-')}</td>
+      <td><span class="pill ${hasEvidence ? 'ok' : 'warn'}">${hasEvidence ? '有证据链' : '待补证据'}</span></td>
+      <td>${share ? `<a href="${escapeHtml(share)}" target="_blank" rel="noopener noreferrer">对话链接</a>` : '-'}</td>
+      <td>${image ? `<a href="${escapeHtml(image)}" target="_blank" rel="noopener noreferrer">诊断截图</a>` : '-'}</td>
+    </tr>`
+  }).join('')
+  const comparisonRows = results.map(item => {
+    const result = item.result || {}
+    const cls = statusClass(item)
+    const mention = Number(result.status) === 1 ? '已出现' : Number(result.status) === 3 ? '未完成' : '未出现'
+    const explain = Number(result.status) === 1
+      ? '该平台已能识别并推荐当前品牌。'
+      : Number(result.status) === 3
+        ? '本次查询未完成，费用已按接口状态处理。'
+        : '当前模型回答中暂未形成品牌推荐，需要通过权威信源与品牌内容继续投喂。'
+    return `<tr>
+      <td><strong>${escapeHtml(item.platformName || item.platform || '-')}</strong></td>
+      <td><span class="pill ${cls}">${mention}</span></td>
+      <td>${escapeHtml(result.hit_word || keywordText || '-')}</td>
+      <td>${escapeHtml(explain)}</td>
+    </tr>`
+  }).join('')
+  const platformText = results.map(item => `${item.platformName || item.platform || '平台'}：${item.statusLabel || diagnosisStatus(item.result || {}).label}`).join('；') || String(task.statusLabel || '-')
+  const scoreDegree = Math.round(score * 3.6)
+  const conclusionTitle = collected > 0
+    ? '品牌已在部分AI模型中形成可见信号'
+    : '当前品牌在主流AI回答中尚未形成稳定推荐'
+  const conclusionText = collected > 0
+    ? `本次诊断中已有 ${collected} 个模型出现品牌信号，下一步应围绕未覆盖平台补充权威信源与高质量问答内容。`
+    : `本次诊断覆盖 ${total || 0} 个AI模型，暂未发现稳定品牌推荐，需要优先建设可被模型抓取、理解和引用的品牌信源。`
+  const signalLevel = score >= 70 ? '可见度较好' : score >= 45 ? '有基础信号' : '基础薄弱'
+  const actionRows = [
+    ['1', '品牌事实统一', '统一公司全称、品牌简称、服务范围和代表能力，减少AI回答中的识别偏差。', '品牌官网 / 知识库'],
+    ['2', '行业问题覆盖', `围绕“${keywordText}”持续发布选择、对比、避坑、推荐类内容。`, '新闻源 / 自媒体'],
+    ['3', '证据链补强', '保留诊断截图、对话链接与发布链接，形成可复查的GEO优化记录。', '诊断报告 / 发布记录'],
+    ['4', '未收录平台补投', '对未收录平台换角度补发内容，不重复堆同一篇文章。', '媒体投喂 / 补发任务'],
+  ].map(row => `<tr><td>${row[0]}</td><td><strong>${escapeHtml(row[1])}</strong></td><td>${escapeHtml(row[2])}</td><td>${escapeHtml(row[3])}</td></tr>`).join('')
+  const modelPercentCards = results.map((item, index) => {
+    const result = item.result || {}
+    const mentioned = Number(result.status) === 1
+    const errored = Number(result.status) === 3 || item.refunded
+    const percent = mentioned ? 100 : 0
+    const tone = mentioned ? 'grad-wenxin text-wenxin' : errored ? 'grad-negative text-red' : 'grad-deepseek text-deepseek'
+    return `<div class="model-stat ${tone}">
+      <p>${escapeHtml(item.platformName || item.platform || `模型${index + 1}`)}</p>
+      <strong>${percent}%</strong>
+      <span>${mentioned ? '正面提及率' : errored ? '查询完成率' : '品牌提及率'}</span>
+    </div>`
+  }).join('')
+  const positiveAnalysisRows = results.map(item => {
+    const result = item.result || {}
+    const mentioned = Number(result.status) === 1
+    const status = item.statusLabel || diagnosisStatus(result).label
+    return `<tr>
+      <td>${escapeHtml(result.question || questionText)}</td>
+      <td><span class="mini-tag ${mentioned ? 'ok' : 'warn'}">${mentioned ? '是' : '否'}</span></td>
+      <td>${escapeHtml(mentioned ? '品牌已出现在模型回答中' : status)}</td>
+      <td>${escapeHtml(result.hit_word || keywordText || '-')}</td>
+    </tr>`
+  }).join('')
+  const sourceRankRows = results.map((item, index) => {
+    const result = item.result || {}
+    const share = safeUrl(result.share_url)
+    const image = safeUrl(result.img_url)
+    return `<tr>
+      <td>${index + 1}</td>
+      <td>${escapeHtml(item.platformName || item.platform || '-')}</td>
+      <td>${share ? `<a href="${escapeHtml(share)}" target="_blank" rel="noopener noreferrer">对话链接</a>` : '-'}</td>
+      <td>${image ? `<a href="${escapeHtml(image)}" target="_blank" rel="noopener noreferrer">截图链接</a>` : '-'}</td>
+      <td>${escapeHtml(item.statusLabel || diagnosisStatus(result).label)}</td>
+    </tr>`
+  }).join('')
+  const perModelSections = results.map((item, index) => {
+    const result = item.result || {}
+    const name = escapeHtml(item.platformName || item.platform || `模型${index + 1}`)
+    const mentioned = Number(result.status) === 1
+    const share = safeUrl(result.share_url)
+    const image = safeUrl(result.img_url)
+    const bar = mentioned ? 100 : 0
+    return `<section class="section model-section">
+      <h2 class="toc-title">${name}<span class="${mentioned ? 'green' : 'red'}">${mentioned ? '正面' : '未收录'}</span>数据分析</h2>
+      <div class="chart-block">
+        <div class="chart-title">${name} 品牌可见度对比</div>
+        <div class="bar-chart">
+          <div class="bar-item"><div class="bar-value">${bar}%</div><div class="bar" style="height:${Math.max(8, bar * 1.6)}px"></div><span>${escapeHtml(brand)}</span></div>
+          <div class="bar-item"><div class="bar-value">${evidenceRate}%</div><div class="bar secondary" style="height:${Math.max(8, evidenceRate * 1.6)}px"></div><span>证据链</span></div>
+          <div class="bar-item"><div class="bar-value">${stableRate}%</div><div class="bar third" style="height:${Math.max(8, stableRate * 1.6)}px"></div><span>查询完成</span></div>
+        </div>
+      </div>
+      <div class="data-card">
+        <h3>${name} - 品牌决策期基础数据</h3>
+        <table class="analysis-table">
+          <thead><tr><th>提问词</th><th>是否提及</th><th>模型反馈</th><th>证据</th></tr></thead>
+          <tbody><tr>
+            <td>${escapeHtml(result.question || questionText)}</td>
+            <td><span class="mini-tag ${mentioned ? 'ok' : 'warn'}">${mentioned ? '是' : '否'}</span></td>
+            <td>${escapeHtml(item.statusLabel || diagnosisStatus(result).label)}</td>
+            <td>${share ? `<a href="${escapeHtml(share)}" target="_blank" rel="noopener noreferrer">对话</a>` : '-'} ${image ? `<a href="${escapeHtml(image)}" target="_blank" rel="noopener noreferrer">截图</a>` : ''}</td>
+          </tr></tbody>
+        </table>
+      </div>
+    </section>`
+  }).join('')
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(brand)}_GEO品牌诊断报告</title>
+  <style>
+    :root{--primary:#4F46E5;--secondary:#7C3AED;--deepseek:#4F46E5;--wenxin:#10B981;--tongyi:#F59E0B;--text:#1E293B;--sub:#64748B;--border:#E2E8F0;--light:#F8FAFC;}
+    *{box-sizing:border-box}
+    body{margin:0;background:#f1f5f9;color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}
+    .hero{position:relative;overflow:hidden;background:linear-gradient(135deg,rgba(79,70,229,.08),rgba(124,58,237,.04),rgba(255,255,255,0));padding:54px 20px 44px;}
+    .container{max-width:1240px;margin:0 auto;}
+    .hero h1{margin:0;text-align:center;font-size:clamp(36px,5vw,58px);line-height:1.08;font-weight:900;background:linear-gradient(90deg,var(--primary),var(--secondary),var(--primary));-webkit-background-clip:text;background-clip:text;color:transparent;}
+    .hero p{text-align:center;color:var(--sub);font-size:20px;margin:18px 0 0;font-weight:600;}
+    .download{display:flex;justify-content:center;margin-top:28px}.download a{color:#e66445;font-size:18px;font-weight:800;text-decoration:none}.save-note{text-align:center;color:#888;font-size:13px;margin-top:12px}
+    .wrap{max-width:1240px;margin:0 auto;padding:34px 20px 70px;}
+    .section{margin-bottom:28px;background:var(--light);border:1px solid var(--border);border-radius:14px;padding:24px 26px;box-shadow:0 8px 24px rgba(15,23,42,.04)}
+    .title{display:flex;align-items:center;margin:0 0 22px;font-size:20px;font-weight:900;line-height:1.2}.title:before{content:"";width:5px;height:22px;border-radius:999px;background:linear-gradient(180deg,var(--primary),var(--secondary));margin-right:12px;flex:0 0 auto}
+    .overview{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:stretch}.overview-card,.model-stat{border:1px solid var(--border);border-radius:12px;padding:18px;background:#fff}.overview-card{min-height:116px;display:flex;flex-direction:column;justify-content:center}.overview-card p,.model-stat p{margin:0 0 8px;color:var(--sub);font-size:13px;font-weight:800}.overview-card strong{font-size:19px;line-height:1.45}.overview-card span{color:#475569;line-height:1.7}
+    .grad-data1{background:linear-gradient(180deg,rgba(6,182,212,.11),rgba(6,182,212,.03));border-color:rgba(6,182,212,.25)}.grad-data2{background:linear-gradient(180deg,rgba(139,92,246,.12),rgba(139,92,246,.03));border-color:rgba(139,92,246,.25)}.grad-data3{background:linear-gradient(180deg,rgba(16,185,129,.12),rgba(16,185,129,.03));border-color:rgba(16,185,129,.25)}
+    .score-box{display:grid;grid-template-columns:178px minmax(0,620px);justify-content:center;align-items:center;gap:30px;text-align:left}.ring{width:178px;height:178px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#ff9500 var(--score),#E2E8F0 0)}.ring-inner{width:132px;height:132px;border-radius:50%;background:#fff;display:grid;place-items:center;text-align:center}.ring-inner strong{font-size:42px;line-height:1}.ring-inner span{display:block;color:var(--sub);margin-top:4px}
+    .model-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;align-items:stretch}.model-stat{text-align:center;min-height:116px;display:flex;flex-direction:column;justify-content:center}.model-stat strong{font-size:26px;display:block;margin-bottom:4px;line-height:1}.model-stat span{color:var(--sub);font-size:12px}.grad-deepseek{background:linear-gradient(180deg,rgba(79,70,229,.12),rgba(79,70,229,.03));border-color:rgba(79,70,229,.25)}.grad-wenxin{background:linear-gradient(180deg,rgba(16,185,129,.12),rgba(16,185,129,.03));border-color:rgba(16,185,129,.25)}.grad-negative{background:linear-gradient(180deg,rgba(239,68,68,.10),rgba(239,68,68,.03));border-color:rgba(239,68,68,.22)}.text-deepseek{color:var(--deepseek)}.text-wenxin{color:var(--wenxin)}.text-red{color:#ef4444}
+    .toc-title{text-align:center;font-size:26px;font-weight:900;color:var(--primary);padding-bottom:16px;margin:0 0 22px;border-bottom:2px solid #eee}.toc-title .green{color:#22c55e}.toc-title .red{color:#ef4444}
+    .model-section{background:#fff}.model-section .toc-title{margin-bottom:20px}
+    .chart-block{margin-top:0;padding:18px 22px;background:linear-gradient(180deg,#f0fdfa,#fff);border-radius:12px;border:1px solid #cfe8df}.chart-title{text-align:center;font-weight:900;margin-bottom:12px}.bar-chart{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:end;height:190px;padding:0 28px 12px;border-bottom:1px solid #cbd5e1}.bar-item{display:flex;flex-direction:column;align-items:center;height:100%;justify-content:flex-end;min-width:0}.bar-value{font-size:13px;color:#475569;margin-bottom:6px;font-weight:800}.bar{width:44px;min-height:8px;background:#4F46E5;border-radius:7px 7px 0 0}.bar.secondary{background:#10B981}.bar.third{background:#F59E0B}.bar-item span{margin-top:8px;font-size:12px;color:#334155;text-align:center;max-width:120px;line-height:1.35}
+    .data-card{margin-top:16px}.data-card h3{font-size:16px;margin:0 0 10px;color:#0f172a}table{width:100%;border-collapse:collapse;background:#fff;font-size:14px;table-layout:fixed}th,td{border:1px solid #ddd;padding:10px 12px;text-align:center;vertical-align:middle;line-height:1.5}th{background:#f8fafc;font-weight:900}.analysis-table th:first-child,.analysis-table td:first-child{text-align:left;width:45%}.analysis-table th:nth-child(2),.analysis-table td:nth-child(2){width:82px}.analysis-table th:nth-child(3),.analysis-table td:nth-child(3){width:148px}.analysis-table th:nth-child(4),.analysis-table td:nth-child(4){text-align:left;width:auto}.source-table th:first-child,.source-table td:first-child{width:80px}.source-table th:nth-child(2),.source-table td:nth-child(2){width:220px}.source-table th:nth-child(3),.source-table td:nth-child(3),.source-table th:nth-child(4),.source-table td:nth-child(4){width:180px}.source-table th:last-child,.source-table td:last-child{text-align:center}.mini-tag{display:inline-flex;align-items:center;justify-content:center;min-width:32px;border-radius:999px;padding:5px 10px;font-size:12px;font-weight:900}.mini-tag.ok{background:#dcfce7;color:#166534}.mini-tag.warn{background:#fee2e2;color:#991b1b}a{color:#2563eb;font-weight:800;text-decoration:none}
+    .suggest-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.suggest{border-radius:16px;border:1px solid #cfe8df;background:linear-gradient(180deg,#f0fdfa,#fff);padding:20px}.suggest.blue{border-color:#bfdbfe;background:linear-gradient(180deg,#eff6ff,#fff)}.suggest h3{margin:0 0 12px;font-size:18px}.suggest ul{margin:0;padding-left:20px;line-height:1.9;color:#334155}.footer{text-align:center;color:#64748b;font-size:12px;margin-top:26px}
+    @media(max-width:900px){.overview,.model-stats,.suggest-grid{grid-template-columns:1fr}.score-box{flex-direction:column;text-align:center}.wrap{padding-left:0;padding-right:0}.section{border-radius:0;border-left:0;border-right:0}.table-wrap{overflow:auto}table{min-width:880px}}
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="container">
+      <h1>GEO品牌AI诊断报告</h1>
+      <p>${escapeHtml(brand)} · 报告生成：${escapeHtml(createdTime || updatedTime || '-')}</p>
+      <div class="download">${reportUrl ? `<a href="${escapeHtml(reportUrl)}" download="${escapeHtml(safeFileName(`${brand}_GEO品牌诊断报告`, 80))}.html">下载报告</a>` : ''}</div>
+      <div class="save-note">诊断报告云端仅保存有限周期，如需永久留存，请及时下载报告</div>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="section">
+      <h2 class="title">报告核心概览</h2>
+      <div class="overview">
+        <div class="overview-card grad-data1"><p>公司/品牌</p><strong>${escapeHtml(brand)}</strong></div>
+        <div class="overview-card grad-data2"><p>核心产品</p><span>${escapeHtml(keywordText)}</span></div>
+        <div class="overview-card grad-data3"><p>评级</p><strong>${escapeHtml(grade)}</strong><span> · ${escapeHtml(signalLevel)}</span></div>
+      </div>
+    </section>
+    <section class="section">
+      <h2 class="title">AI搜索诊断综合得分</h2>
+      <div class="score-box">
+        <div class="ring" style="--score:${scoreDegree}deg"><div class="ring-inner"><div><strong>${score}</strong><span>/100</span></div></div></div>
+        <div>
+          <h3>GEO效果评估评分</h3>
+          <p style="color:#64748b;max-width:360px;line-height:1.8">AI搜索场景中品牌提及率、曝光度、证据链完整度和平台查询完成度的综合评分。</p>
+          <p style="font-weight:800;color:#334155">${escapeHtml(platformText)}</p>
+        </div>
+      </div>
+    </section>
+    <section class="section">
+      <h2 class="toc-title">主流大模型<span class="green">正面</span>品牌分析</h2>
+      <div class="model-stats">${modelPercentCards || '<p>暂无模型数据</p>'}</div>
+    </section>
+    <section class="section">
+      <h2 class="toc-title">主流大模型竞品数据对比</h2>
+      <div class="table-wrap data-card">
+        <table class="analysis-table">
+          <thead><tr><th>提问词</th><th>是否提及</th><th>反馈结果</th><th>命中词</th></tr></thead>
+          <tbody>${positiveAnalysisRows || '<tr><td colspan="4">暂无对比数据。</td></tr>'}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section">
+      <h2 class="toc-title">引用源平台排行榜</h2>
+      <div class="table-wrap data-card">
+        <table class="source-table">
+          <thead><tr><th>排名</th><th>平台</th><th>对话链接</th><th>截图证据</th><th>状态</th></tr></thead>
+          <tbody>${sourceRankRows || '<tr><td colspan="5">暂无引用源数据。</td></tr>'}</tbody>
+        </table>
+      </div>
+    </section>
+    ${perModelSections}
+    <section class="section">
+      <h2 class="title">GEO诊断建议</h2>
+      <div class="suggest-grid">
+        <article class="suggest">
+          <h3>GEO大模型优化建议</h3>
+          <ul>
+            <li>围绕“${escapeHtml(keywordText)}”补充服务商选择、品牌对比、能力说明、案例验证等内容，让 AI 有足够上下文识别品牌。</li>
+            <li>把品牌名称、主体公司、服务范围、代表成果写进稳定页面和高质量文章，避免只有营销口号没有事实支撑。</li>
+            <li>对未收录平台优先补充问答型内容，例如“${escapeHtml(questionText)}”，提高模型回答时的引用概率。</li>
+          </ul>
+        </article>
+        <article class="suggest blue">
+          <h3>信源投放建议</h3>
+          <ul>
+            <li>优先投放可被 AI 抓取的新闻源、自媒体、行业站与品牌官网内容，形成多平台一致的品牌事实链。</li>
+            <li>每次投放后保留对话链接、截图和收录状态，连续观察 DeepSeek、豆包、元宝、通义、Kimi 等平台变化。</li>
+            <li>若某平台长期未收录，应补发同主题不同角度内容，而不是重复发布同一篇文章。</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+    <div class="footer">诊断报告云端仅保存有限周期，请及时打开、下载或保存。本报告仅基于当前平台返回结果生成，不替代人工品牌策略判断。</div>
+  </main>
+</body>
+</html>`
+}
+const diagnosisStatus = data => {
+  const status = Number(data?.status ?? data?.data?.status)
+  if (status === 1) return { label: '已收录', final: true }
+  if (status === 2) return { label: '未收录', final: true }
+  if (status === 3) return { label: '查询失败已退款', final: true, refunded: true }
+  return { label: '查询中', final: false }
+}
+
+function reportRequirement(candidate, project, body) {
+  return [
+    firstText(body?.requirement, project?.recommendWord, project?.name),
+    project?.industry ? `行业：${project.industry}` : '',
+    project?.city ? `地区：${project.city}` : '',
+    candidate?.fullName ? `主体全称：${candidate.fullName}` : '',
+    candidate?.aliases?.length ? `别名：${candidate.aliases.join('、')}` : '',
+    '请围绕品牌可见度、AI推荐理由、竞品对比、内容缺口和优化动作生成诊断报告。',
+  ].filter(Boolean).join('；')
+}
+
+async function handleDiagnosisRequest(req, res, requestUrl) {
+  if (!requestUrl.pathname.startsWith('/api/diagnosis')) return false
+  if (!roles[requestAccount.getStore()?.role || 'project_admin']?.includes?.('media:publish')) throw scopeError('需要项目发布权限', 403)
+  if (!configured('XIAOQINGWA_KEY') || !configured('XIAOQINGWA_BASE_URL')) throw scopeError('小青蛙诊断接口尚未配置', 503)
+  const { owner, store } = auth.diagnosisOrders(currentProjectScope().projectId)
+  const client = diagnosisClient()
+  const projectRows = getStateArray('geo.projectRows')
+  if (req.method === 'GET' && requestUrl.pathname === '/api/diagnosis/report-script') {
+    const task = store.get(owner, String(requestUrl.searchParams.get('id') || ''))
+    const scriptIndex = Number(requestUrl.searchParams.get('n') || 0)
+    if (!task || task.type !== 'report' || task.state !== 'finished') return javascript(res, 404, '')
+    const page = firstFullText(task.download?.html, task.download?.reportHtml)
+    const scripts = reportScripts(page)
+    if (!Number.isSafeInteger(scriptIndex) || scriptIndex < 0 || scriptIndex >= scripts.length) return javascript(res, 404, '')
+    return javascript(res, 200, scripts[scriptIndex])
+  }
+  if (req.method === 'GET' && requestUrl.pathname === '/api/diagnosis/report-view') {
+    const task = store.get(owner, String(requestUrl.searchParams.get('id') || ''))
+    if (!task) return html(res, 404, '<!doctype html><meta charset="utf-8"><title>报告不存在</title><p>诊断任务不存在。</p>')
+    if (task.type === 'inclusion') {
+      if (task.state !== 'finished') return html(res, 409, '<!doctype html><meta charset="utf-8"><title>诊断未完成</title><p>标准版诊断还在查询中，请刷新后再查看报告。</p>')
+      return html(res, 200, standardDiagnosisReportHtml(task))
+    }
+    if (task.type !== 'report' || !task.reportId) return html(res, 404, '<!doctype html><meta charset="utf-8"><title>报告不存在</title><p>报告任务不存在或尚未生成报告编号。</p>')
+    if (task.state !== 'finished') return html(res, 409, '<!doctype html><meta charset="utf-8"><title>报告生成中</title><p>报告还在生成中，请稍后刷新后再查看结果。</p>')
+    let download = task.download
+    if (!download?.html && !download?.pdf && !download?.url && !download?.downloadUrl) {
+      download = await client.reportDownload(task.reportId)
+      store.update(owner, task.id, { download, statusLabel: '报告已取回' }, 'finished')
+    }
+    const page = firstFullText(download?.html, download?.reportHtml)
+    if (page) return html(res, 200, reportPageWithExternalScripts(task.id, page))
+    const url = firstText(download?.url, download?.download_url, download?.downloadUrl)
+    if (url) return html(res, 200, `<!doctype html><meta charset="utf-8"><title>诊断报告</title><script>location.replace(${JSON.stringify(url)})</script><p><a href="${String(url).replaceAll('"', '&quot;')}">打开诊断报告</a></p>`)
+    const pdf = firstFullText(download?.pdf, download?.pdf_base64, download?.pdfBase64, download?.file)
+    if (pdf) return html(res, 200, `<!doctype html><meta charset="utf-8"><title>诊断报告PDF</title><iframe style="position:fixed;inset:0;width:100%;height:100%;border:0" src="data:application/pdf;base64,${pdf.replace(/^data:application\/pdf;base64,/, '')}"></iframe>`)
+    return html(res, 502, '<!doctype html><meta charset="utf-8"><title>报告无法打开</title><p>报告已取回，但供应商没有返回可直接打开的内容。</p>')
+  }
+  if (req.method === 'GET' && requestUrl.pathname === '/api/diagnosis/tasks') {
+    return json(res, 200, { ok: true, tasks: store.list(owner) })
+  }
+  if (req.method !== 'POST') throw scopeError('诊断接口不支持此方法', 405)
+  const body = await readJson(req)
+  if (requestUrl.pathname === '/api/diagnosis/create') {
+    const brand = trimText(body?.brand, 120)
+    const project = projectRows.find(row => row.name === brand)
+    if (!project) throw scopeError('品牌不属于当前项目', 400)
+    const platforms = [...new Set((Array.isArray(body?.platforms) ? body.platforms : [body?.platform]).map(value => String(value || '')).filter(Boolean))]
+    if (!platforms.length || platforms.some(platform => !diagnosisPlatformNames[platform])) throw scopeError('请选择有效的诊断平台', 400)
+    const keywords = trimText(body?.keywords || body?.keyword || project.recommendWord || project.coreKeyword || brand, 200)
+    const platformNames = platforms.map(platform => diagnosisPlatformNames[platform])
+    const platformLabel = platforms.length === Object.keys(diagnosisPlatformNames).length ? '主流AI平台' : platformNames.join('、')
+    const question = trimText(body?.question || `在${platformLabel}里搜索${keywords}，是否能推荐${project.recommendWord || brand}？`, 300)
+    const task = store.start(owner, { type: 'inclusion', costCents: DIAGNOSIS_INCLUSION_CENTS, data: { brand, platforms, platformNames, keywords, question } })
+    try {
+      const providerRequests = []
+      for (const platform of platforms) {
+        const submitted = await client.createInclusion({ platform, keywords, question, thirdId: `${task.id}-${platform}` })
+        providerRequests.push({ platform, platformName: diagnosisPlatformNames[platform], requestId: submitted.requestId, raw: submitted.raw })
+      }
+      const updated = store.submit(owner, task.id, { provider: 'xiaoqingwa', providerRequests, providerRequestId: providerRequests[0]?.requestId || '', statusLabel: '已提交' })
+      return json(res, 200, { ok: true, task: updated, tasks: store.list(owner) })
+    } catch (error) {
+      store.fail(owner, task.id, error.message)
+      throw error
+    }
+  }
+  if (requestUrl.pathname === '/api/diagnosis/report') {
+    const brand = trimText(body?.brand, 120)
+    const project = projectRows.find(row => row.name === brand)
+    if (!project) throw scopeError('品牌不属于当前项目', 400)
+    const input = trimText(body?.input || `${project.recommendWord || brand} ${project.industry || ''} ${project.city || ''}`, 200)
+    const task = store.start(owner, { type: 'report', costCents: DIAGNOSIS_REPORT_CENTS, data: { brand, input } })
+    try {
+      const analysis = await client.preAnalyze(input)
+      const candidate = Array.isArray(analysis?.candidates) ? analysis.candidates[0] : (Array.isArray(analysis?.data?.candidates) ? analysis.data.candidates[0] : {})
+      const brandName = firstText(body?.brandName, candidate?.fullName, project.recommendWord, brand)
+      const requirement = reportRequirement(candidate, project, body)
+      const report = await client.createReport({ brandName, requirement, thirdPartyIdentifier: task.id })
+      const reportId = reportIdFromPayload(report)
+      const updated = store.submit(owner, task.id, { provider: 'xiaoqingwa', analysis, candidate, brandName, requirement, reportId, providerRaw: report, thirdPartyIdentifier: task.id, statusLabel: reportId ? '报告生成中' : '报告已提交，等待平台返回报告编号' })
+      return json(res, 200, { ok: true, task: updated, tasks: store.list(owner) })
+    } catch (error) {
+      if (error?.uncertain) {
+        const updated = store.submit(owner, task.id, { provider: 'xiaoqingwa', statusLabel: '报告提交待核实', error: error.message, brandName: firstText(body?.brandName, project.recommendWord, brand), requirement: reportRequirement({}, project, body) })
+        return json(res, 200, { ok: true, task: updated, tasks: store.list(owner), warning: error.message })
+      }
+      store.fail(owner, task.id, error.message)
+      throw error
+    }
+  }
+  if (requestUrl.pathname === '/api/diagnosis/refresh') {
+    const ids = Array.isArray(body?.ids) ? new Set(body.ids.map(String)) : null
+    const next = []
+    for (const task of store.list(owner).filter(task => !ids || ids.has(task.id))) {
+      if (['failed', 'refunded'].includes(task.state)) {
+        next.push(task)
+        continue
+      }
+      if (task.type === 'inclusion' && (task.providerRequestId || task.providerRequests?.length)) {
+        const requests = Array.isArray(task.providerRequests) && task.providerRequests.length ? task.providerRequests : [{ platform: task.platform, platformName: task.platformName, requestId: task.providerRequestId }]
+        const results = []
+        for (const item of requests) {
+          const result = await client.checkInclusion(item.requestId)
+          const status = diagnosisStatus(result)
+          results.push({ ...item, result, statusLabel: status.label, final: status.final, refunded: status.refunded })
+        }
+        const allFinal = results.every(item => item.final)
+        const allRefunded = results.every(item => item.refunded)
+        const statusLabel = results.map(item => `${item.platformName || item.platform || '平台'}：${item.statusLabel}`).join('；')
+        next.push(allRefunded ? store.refund(owner, task.id, '小青蛙查收录反馈失败已退款') : store.update(owner, task.id, { providerResults: results, statusLabel }, allFinal ? 'finished' : task.state))
+      } else if (task.type === 'report') {
+        let reportId = firstText(task.reportId, reportIdFromPayload(task.providerRaw, task.providerResult))
+        if (!reportId) {
+          next.push(store.update(owner, task.id, { statusLabel: '报告已提交，等待平台返回报告编号' }, task.state))
+          continue
+        }
+        const result = await client.reportStatus(reportId)
+        reportId = firstText(reportId, reportIdFromPayload(result))
+        const status = reportStatusInfo(result)
+        if (status.failed) {
+          next.push(store.refund(owner, task.id, `PRO报告生成失败，已退回费用：${status.raw}`))
+          continue
+        }
+        if (status.finished) {
+          const download = await client.reportDownload(reportId)
+          const ready = reportDownloadReady(download)
+          next.push(store.update(owner, task.id, { reportId, providerResult: result, download, statusLabel: ready ? '报告已取回' : '报告已完成，等待平台返回报告文件' }, ready ? 'finished' : task.state))
+          continue
+        }
+        next.push(store.update(owner, task.id, { reportId, providerResult: result, statusLabel: status.raw || '报告生成中' }, task.state))
+      }
+    }
+    return json(res, 200, { ok: true, tasks: store.list(owner), refreshed: next })
+  }
+  if (requestUrl.pathname === '/api/diagnosis/download') {
+    const task = store.get(owner, String(body?.id || ''))
+    if (!task || task.type !== 'report' || !task.reportId) throw scopeError('报告任务不存在或尚未生成报告编号', 404)
+    if (task.state !== 'finished') throw scopeError('报告还在生成中，请稍后刷新后再查看结果', 409)
+    const download = await client.reportDownload(task.reportId)
+    store.update(owner, task.id, { download, statusLabel: '报告已取回' }, 'finished')
+    return json(res, 200, { ok: true, download, task: store.get(owner, task.id) })
+  }
+  throw scopeError('诊断接口不存在', 404)
+}
 
 function hasTrustedProjectHeaders(req) {
   return process.env.GEO_ALLOW_HEADER_IDENTITY === 'true'
@@ -7037,7 +7659,10 @@ function projectUserFromAccount(account, req) {
 function projectSummaryFor(user) {
   const registered = visibleProjectAccounts(user)
   if (registered.length) {
-    return registered.map(project => runInProjectScope(resolveProjectScope({ ...user, projectId: project.projectId }), () => ({
+    return registered.map(project => String(project.status || '').toLowerCase() !== 'active' ? {
+      projectId: project.projectId, agentId: project.agentId, projectName: project.projectName,
+      status: project.status, createdAt: project.createdAt, updatedAt: project.updatedAt,
+    } : runInProjectScope(resolveProjectScope({ ...user, projectId: project.projectId }), () => ({
       projectId: project.projectId,
       agentId: project.agentId,
       projectName: project.projectName,
@@ -7064,13 +7689,133 @@ function projectSummaryFor(user) {
 async function handleProjectRequest(req, res, account, requestUrl) {
   if (req.method === 'OPTIONS') return json(res, 204, {})
   if (req.headers['x-geo-workspace'] && req.headers['x-geo-workspace'] !== account.workspaceId) return json(res, 409, { ok: false, error: '账号已切换，请刷新页面重新登录' })
-  if (['/api/config/status', '/api/model/test'].includes(requestUrl.pathname) && !roles[account.role].includes('system:manage')) return json(res, 403, { ok: false, error: '需要系统管理权限' })
+  if(await newsPublishing.handle(req,res,requestUrl,account))return
+  if(await autoPublishPlans.handle(req,res,requestUrl,account))return
+  if (requestUrl.pathname.startsWith('/api/diagnosis')) return await handleDiagnosisRequest(req, res, requestUrl)
+  if(req.method==='POST' && requestUrl.pathname==='/api/keywords/expand' && account.role!=='super_admin')throw scopeError('此功能的计费管控尚未启用，请联系总管理员处理',403)
+  if (req.method === 'POST' && requestUrl.pathname === '/api/providers/research') {
+    const body = await readJson(req)
+    const project = getStateArray('geo.projectRows').find(row => row.name === body.brand)
+    if (!project) throw scopeError('品牌不属于当前项目')
+    if (typeof body.company !== 'string' || !body.company.trim() || body.company.length > 150) throw scopeError('请填写有效的公司名称', 400)
+    const {lookupProvider} = await import('./provider-lookup.mjs')
+    const research = await lookupProvider(projectDirectory('data'), { brand: body.brand, company: body.company.trim(), industry: project.industry, city: project.city }, researchProvider)
+    // Persist against the latest rows so navigating away cannot lose completed research.
+    setStateArray('geo.rankingCandidateRows', getStateArray('geo.rankingCandidateRows').map(row => {
+      if (row[0] !== body.brand || row[1] !== body.company.trim()) return row
+      const next = [...row]
+      next[8] = JSON.stringify(research)
+      return next
+    }))
+    return json(res, 200, { ok: true, research })
+  }
+  if (['/api/config/status', '/api/model/test'].includes(requestUrl.pathname) && !['super_admin', 'agent'].includes(account.role)) return json(res, 403, { ok: false, error: '需要总后台或代理权限' })
   if (requestUrl.pathname === '/api/media/publish' && !roles[account.role].includes('media:publish')) return json(res, 403, { ok: false, error: '需要发布权限' })
     if (req.method === 'GET' && requestUrl.pathname === '/api/articles/download') {
       return sendDownload(res, requestUrl.searchParams.get('file'))
     }
     if (req.method === 'GET' && requestUrl.pathname === '/api/gallery/file') {
       return sendGalleryFile(res, requestUrl.searchParams.get('file'))
+    }
+    if (requestUrl.pathname === '/api/social/accounts' && ['GET','POST','DELETE'].includes(req.method)) {
+      const {socialAccounts}=await import('./social-accounts.mjs')
+      if (req.method === 'DELETE') {
+        if (!roles[account.role].includes('media:publish')) throw scopeError('需要发布权限')
+        const {deleteSocialAccount}=await import('./social-accounts.mjs')
+        const body=await readJson(req)
+        const active = getStateArray('geo.distributionTasks').some(task => task && typeof task === 'object' && task.channel === 'account-social' && task.brand === body?.brand && Array.isArray(task.rows) && task.rows.some(row => row.accountId === body.id && !['cancelled','review','published'].includes(row.status)))
+        if (active) throw scopeError('该账号还有待执行或需处理任务，先取消任务后再删除', 400)
+        const value=deleteSocialAccount(projectDirectory('data'),body?.brand||'',getStateArray('geo.projectRows'),body)
+        return json(res,200,{ok:true,account:value})
+      }
+      const body=req.method==='POST'?await readJson(req):undefined
+      const brand=body?.brand||requestUrl.searchParams.get('brand')||''
+      const value=socialAccounts(projectDirectory('data'),brand,getStateArray('geo.projectRows'),body)
+      return json(res,200,{ok:true,...(body?{account:value}:{accounts:value})})
+    }
+    if (requestUrl.pathname === '/api/social/accounts/status' && req.method === 'POST') {
+      if (!roles[account.role].includes('media:publish')) throw scopeError('需要发布权限')
+      const {updateSocialAccount}=await import('./social-accounts.mjs')
+      const body=await readJson(req)
+      const row=updateSocialAccount(projectDirectory('data'),body?.brand||'',getStateArray('geo.projectRows'),body)
+      return json(res,200,{ok:true,account:row})
+    }
+    if (requestUrl.pathname === '/api/social/tasks/status' && req.method === 'POST') {
+      if (!roles[account.role].includes('media:publish')) throw scopeError('需要发布权限')
+      const body=await readJson(req)
+      const brand=String(body?.brand||'')
+      if (!getStateArray('geo.projectRows').some(row => row.name === brand)) throw scopeError('品牌不属于当前项目', 400)
+      const statuses = new Set(['pending','blocked','submitting','prepared','uncertain','review','published','cancelled','failed'])
+      if (typeof body.taskId !== 'string' || typeof body.rowId !== 'string' || !statuses.has(body.status)) throw scopeError('发布状态无效', 400)
+      let changed = false, updatedTask = null
+      const next = getStateArray('geo.distributionTasks').map(task => {
+        if (!task || typeof task !== 'object' || task.channel !== 'account-social' || task.brand !== brand || task.id !== body.taskId) return task
+        const rows = Array.isArray(task.rows) ? task.rows.map(row => {
+          if (!row || row.id !== body.rowId) return row
+          changed = true
+          const nextRow = { ...row, status: body.status, message: typeof body.message === 'string' ? body.message.slice(0, 300) : row.message, updatedAt: new Date().toISOString() }
+          if (body.receipt && typeof body.receipt === 'object') nextRow.receipt = { id: String(body.receipt.id || '').slice(0, 120), url: String(body.receipt.url || '').slice(0, 500) }
+          return nextRow
+        }) : []
+        updatedTask = { ...task, rows, updatedAt: new Date().toISOString() }
+        if (rows.length && rows.every(row => ['review','published','cancelled'].includes(row.status))) updatedTask.status = '已完成'
+        else if (rows.some(row => ['submitting','prepared','uncertain','review','published'].includes(row.status))) updatedTask.status = '执行中'
+        return updatedTask
+      })
+      if (!changed) throw scopeError('发布任务不存在', 404)
+      setStateArray('geo.distributionTasks', next)
+      return json(res,200,{ok:true,task:updatedTask})
+    }
+    if (requestUrl.pathname === '/api/social/tasks' && ['GET','POST','DELETE'].includes(req.method)) {
+      if (!roles[account.role].includes('media:publish')) throw scopeError('需要发布权限')
+      const {socialAccounts}=await import('./social-accounts.mjs')
+      const body=req.method==='POST'?await readJson(req):undefined
+      const deleteBody=req.method==='DELETE'?await readJson(req):undefined
+      const brand=body?.brand||deleteBody?.brand||requestUrl.searchParams.get('brand')||''
+      if (!getStateArray('geo.projectRows').some(row => row.name === brand)) throw scopeError('品牌不属于当前项目', 400)
+      const previous = getStateArray('geo.distributionTasks')
+      if (req.method === 'GET') {
+        const includeCompleted = requestUrl.searchParams.get('includeCompleted') === '1'
+        return json(res, 200, { ok: true, tasks: previous.filter(row => row && typeof row === 'object' && row.channel === 'account-social' && row.brand === brand && (includeCompleted || row.status !== '已完成')) })
+      }
+      if (req.method === 'DELETE') {
+        if (typeof deleteBody?.id !== 'string') throw scopeError('发布任务无效', 400)
+        let changed = false
+        const next = previous.filter(row => {
+          if (row && typeof row === 'object' && row.channel === 'account-social' && row.brand === brand && row.id === deleteBody.id) {
+            changed = true
+            return false
+          }
+          return true
+        })
+        if (!changed) throw scopeError('发布任务不存在', 404)
+        setStateArray('geo.distributionTasks', next)
+        return json(res, 200, { ok: true, id: deleteBody.id })
+      }
+      const accounts = socialAccounts(projectDirectory('data'), brand, getStateArray('geo.projectRows'))
+      const targets = Array.isArray(body.targets) ? body.targets : []
+      if (!targets.length || targets.length > 100 || new Set(targets.map(t => t.id)).size !== targets.length) throw scopeError('请选择发布账号', 400)
+      if (targets.some(t => !accounts.some(a => a.id === t.id) || !Number.isInteger(Number(t.count)) || Number(t.count) < 1 || Number(t.count) > 200)) throw scopeError('发布账号或篇数无效', 400)
+      const articleIds = Array.isArray(body.articleIds) ? body.articleIds : []
+      if (!articleIds.length || articleIds.length > 200 || new Set(articleIds).size !== articleIds.length) throw scopeError('请选择文章', 400)
+      const owned = getStateArray('geo.articleRows')
+      const articles = articleIds.map(id => {
+        const row = owned.find(r => r.id === id && r.project === brand && r.status === '已生成' && typeof r.body === 'string' && r.body.trim())
+        if (!row) throw scopeError('文章不属于当前品牌或没有可发布正文', 403)
+        return { id: row.id, title: row.title, body: row.body }
+      })
+      const total = targets.reduce((sum, t) => sum + Number(t.count), 0)
+      if (total > articles.length) throw scopeError(`只有${articles.length}篇文章可分配`, 400)
+      let offset = 0
+      const rows = targets.flatMap(target => {
+        const selectedAccount = accounts.find(a => a.id === target.id)
+        return articles.slice(offset, offset += Number(target.count)).map(article => ({
+          id: crypto.randomUUID(), articleId: article.id, title: article.title, accountId: selectedAccount.id, accountName: selectedAccount.name, platform: selectedAccount.platform, status: 'pending',
+        }))
+      })
+      const task = { id: crypto.randomUUID(), brand, channel: 'account-social', status: '待执行', createdAt: new Date().toISOString(), batchIds: Array.isArray(body.batchIds) ? body.batchIds.filter(id => typeof id === 'string') : [], rows }
+      setStateArray('geo.distributionTasks', [task, ...previous])
+      return json(res, 201, { ok: true, task })
     }
     if (req.method === 'GET' && requestUrl.pathname === '/api/state') {
       const key = requestUrl.searchParams.get('key') || ''
@@ -7079,28 +7824,154 @@ async function handleProjectRequest(req, res, account, requestUrl) {
     }
     if (req.method === 'POST' && req.url === '/api/state') {
       const body = await readJson(req)
+      if(body.key==='geo.distributionTasks')throw scopeError('发布记录只能通过媒体任务接口管理',403)
       if (!body?.key) return json(res, 400, { ok: false, error: '缺少状态键' })
       return json(res, 200, { ok: true, key: body.key, value: setStateValue(body.key, body.value) })
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/keywords/scenes') {
+      const body=await readJson(req),count=distillationCount(body.count)
+      const brand=String(body.brand||''),core=String(body.coreKeyword||'').trim()
+      const project=getStateArray('geo.projectRows').find(p=>p.name===brand)
+      if(!project)throw scopeError('品牌不属于当前项目',403)
+      if(!core || !(project.coreKeyword===core||getStateArray('geo.keywordRows').some(r=>r[0]===brand&&r[1]===core)))throw scopeError('请选择当前品牌的核心词',400)
+      if(!/^deepseek/i.test(process.env.MODEL_NAME||process.env.QWEN_MODEL||''))throw scopeError('场景拓展需要配置DeepSeek模型',503)
+      const key=currentProjectScope().projectId
+      auth.checkKeywordAccess(key,count)
+      const existing=getStateArray('geo.keywordLibraryRows').filter(r=>r[0]===brand&&r[1]===core).map(r=>r[2])
+      const materials=getStateArray('geo.knowledgeContentRows').filter(r=>r[0]===brand).map(r=>({name:r[2],brand:r[3],evidence:r[4]}))
+      const input={project,core,count,materials,existing,direction:String(body.direction||'').slice(0,300)}
+      const fingerprint=createHash('sha256').update(JSON.stringify(input)).digest('hex')
+      const words=await sceneRequests(key,fingerprint,()=>expandBusinessScenes(input,(messages,temperature,format)=>callQwen(messages,temperature,format,'keywordModel')))
+      return json(res,200,{ok:true,words,requested:count,partial:words.length<count})
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/keywords/distill') {
+      const body=await readJson(req),count=distillationCount(body.count)
+      const core=String(body.coreKeyword||'').trim(),brand=String(body.brand||'')
+      if(!core || core.length>40 || /[\r\n]/.test(core))throw scopeError('请填写40字以内的核心词',400)
+      const project=getStateArray('geo.projectRows').find(p=>p.name===brand)
+      if(!project)throw scopeError('品牌不属于当前项目',403)
+      const scope=currentProjectScope(),key=scope.projectId
+      for(const [k,v] of distillationRuns)if(!v.running && Date.now()-v.at>3600000)distillationRuns.delete(k)
+      const last=distillationRuns.get(key)
+      if(last?.running)throw scopeError('当前项目正在蒸馏，请稍后再试',429)
+      const existing=getStateArray('geo.questionRows').filter(r=>r[0]===brand&&r[1]===core).map(r=>r[2])
+      const hasCore=getStateArray('geo.keywordRows').some(r=>r[0]===brand&&r[1]===core)
+      distillationRuns.set(key,{running:true,at:Date.now()})
+      try {
+        const result=await distillSelectionTerms({core,count,existing})
+        const required=result.terms.length+(hasCore?0:1)
+        if(required)auth.checkKeywordAccess(key,required)
+        else return json(res,200,{ok:true,terms:[],keywordRows:getStateArray('geo.keywordRows'),questionRows:getStateArray('geo.questionRows')})
+        const state=readAppState()
+        if(!(state['geo.projectRows']||[]).some(p=>p.name===brand))throw scopeError('品牌已删除，未保存蒸馏结果',409)
+        const rows=state['geo.questionRows']||[],known=new Set(rows.filter(r=>r[0]===brand&&r[1]===core).map(r=>r[2]))
+        const stamp=new Date().toISOString(),added=result.terms.filter(t=>!known.has(t))
+        state['geo.questionRows']=stampOwnedRows('geo.questionRows',[...rows,...added.map(t=>[brand,core,t,'未收录',stamp])])
+        const all=state['geo.questionRows'].filter(r=>r[0]===brand&&r[1]===core).length
+        const cores=state['geo.keywordRows']||[],old=cores.find(r=>r[0]===brand&&r[1]===core)
+        state['geo.keywordRows']=stampOwnedRows('geo.keywordRows',[[brand,core,String(all),old?.[3]||'已启用',old?.[4]||stamp,old?.[5]||project.recommendWord||project.brand||''],...cores.filter(r=>r[0]!==brand||r[1]!==core)])
+        const data=JSON.stringify(state,null,2),file=stateFilePath(),oldBytes=existsSync(file)?readFileSync(file).length:0
+        if(scope.legacy)writeAppState(state)
+        else auth.persistProjectFiles(key,{...stateCapacity(state),storageMB:ownedStorageAfter(Buffer.byteLength(data)-oldBytes)},[{path:file,data}])
+        return json(res,200,{ok:true,terms:added,keywordRows:state['geo.keywordRows'],questionRows:state['geo.questionRows']})
+      } finally {distillationRuns.set(key,{running:false,at:Date.now()})}
     }
     if (req.method === 'GET' && req.url === '/api/config/status') return json(res, 200, statusPayload())
     if (req.method === 'POST' && req.url === '/api/model/test') {
       const result = await callQwen([{ role: 'user', content: '请只回复：模型连接正常' }], 0.1)
       return json(res, result.ok ? 200 : 503, result)
     }
+    if (requestUrl.pathname === '/api/projects/understanding' && ['GET', 'POST'].includes(req.method)) {
+      const request = req.method === 'GET' ? { projectName: requestUrl.searchParams.get('project'), knowledgeName: requestUrl.searchParams.get('knowledge') || '', coreKeyword: requestUrl.searchParams.get('core') || undefined } : await readJson(req)
+      const input = validateGenerationScope({ project: { name: request.projectName }, packet: { knowledgeName: request.knowledgeName || '', coreKeyword: request.coreKeyword } }, getStateValue, { allowMissingCore: true })
+      const profile = getUnderstanding(input, getStateArray('geo.projectUnderstandingRows'))
+      if (req.method === 'GET') return json(res, 200, { ok: true, ...profile })
+      if (request.action === 'notes') {
+        if (!profile.record || profile.sourceHash !== request.sourceHash) return json(res, 409, { ok: false, error: '资料已变化，请先更新项目理解再修正' })
+        const notes = String(request.notes || '')
+        setStateArray('geo.projectUnderstandingRows', storeUnderstanding(input, profile.record.value, getStateArray('geo.projectUnderstandingRows'), notes))
+      } else if (request.action === 'analyze') {
+        if(account.role!=='super_admin')throw scopeError('独立项目分析尚未启用计费，请联系总管理员处理',403)
+        await understandProject({ ...input, understandingNotes: profile.record?.notes || profile.previous?.notes || '' }, { callModel: callQwen, model: process.env.MODEL_NAME || process.env.QWEN_MODEL, onUnderstanding: (payload, value) => {
+          setStateArray('geo.projectUnderstandingRows', storeUnderstanding(payload, value, getStateArray('geo.projectUnderstandingRows'), profile.record?.notes || profile.previous?.notes || ''))
+        } })
+      } else return json(res, 400, { ok: false, error: '请选择更新理解或保存修正' })
+      return json(res, 200, { ok: true, ...getUnderstanding(input, getStateArray('geo.projectUnderstandingRows')) })
+    }
     if (req.method === 'POST' && req.url === '/api/jobs/start') {
       const body = await readJson(req)
-      const job = startArticleJob(validateGenerationScope(body, getStateValue))
+      const job = startArticleJob(generationInput(body))
       return json(res, 200, { ok: true, job })
     }
     if (req.method === 'GET' && requestUrl.pathname === '/api/jobs/status') {
       const id = requestUrl.searchParams.get('id') || ''
       const job = articleJobs.get(id) || jobJournal.load(id)?.job
-      if (!job || job.projectId !== currentProjectScope().projectId || job.legacyScope !== Boolean(currentProjectScope().legacy)) return json(res, 404, { ok: false, error: '任务不存在或服务已重启' })
+      if (!job || job.deletedAt || job.projectId !== currentProjectScope().projectId || job.legacyScope !== Boolean(currentProjectScope().legacy)) return json(res, 404, { ok: false, error: '任务不存在或服务已重启' })
       return json(res, 200, { ok: true, job: publicJob(job) })
+    }
+    if(req.method==='POST' && requestUrl.pathname==='/api/jobs/delete') {
+      const body=await readJson(req), tasks=getStateArray('geo.taskRows')
+      const target=tasks.find(t=>t.project===body.brand && t.name===body.name)
+      if(!target)throw scopeError('任务不存在',404)
+      const record=target.jobId ? jobJournal.load(target.jobId) : null
+      if(target.jobId && !record)throw scopeError('任务记录无法读取，未执行删除',409)
+      if(record) {
+        if(record.job.projectId!==currentProjectScope().projectId || record.job.legacyScope!==Boolean(currentProjectScope().legacy))throw scopeError('不能删除其他项目任务',403)
+        const job=articleJobs.get(record.job.id)||record.job
+        if(['queued','running'].includes(job.status))throw scopeError('任务仍在运行，请先停止并等待当前篇处理完毕',409)
+        job.deletedAt=new Date().toISOString();job.status='deleted';job.cancelRequested=true
+        jobJournal.save({...record,job});articleJobs.delete(job.id)
+      }
+      setStateArray('geo.taskRows',tasks.filter(t=>t!==target))
+      return json(res,200,{ok:true})
+    }
+    if(req.method==='POST' && requestUrl.pathname==='/api/jobs/stop') {
+      const body=await readJson(req),record=jobJournal.load(String(body.id || ''))
+      if(!record || record.job.projectId!==currentProjectScope().projectId || record.job.legacyScope!==Boolean(currentProjectScope().legacy))throw scopeError('任务不存在',404)
+      const job=articleJobs.get(record.job.id) || record.job
+      if(!['queued','running'].includes(job.status))return json(res,200,{ok:true,job:publicJob(job)})
+      job.cancelRequested=true
+      appendJobLog(job,'已请求停止：当前篇完成后不再启动下一篇')
+      jobJournal.save({...record,job})
+      return json(res,200,{ok:true,job:publicJob(job)})
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/jobs/resume') {
+      const body = await readJson(req)
+      const record = jobJournal.load(String(body.id || ''))
+      if (!record || record.job.projectId !== currentProjectScope().projectId || record.job.legacyScope !== Boolean(currentProjectScope().legacy)) return json(res, 404, { ok: false, error: '任务不存在' })
+      if (record.job.status !== 'failed') return json(res, 409, { ok: false, error: '仅中断的任务可以续跑' })
+      if (!canResumeWritingRelease(record.version, writingRelease.version)) return json(res, 409, { ok: false, error: '生产版本已变化，请新建任务，旧稿仍保留' })
+      record.version = writingRelease.version
+      if(!currentProjectScope().legacy && record.job.completed < record.plans.length && !auth.articleResult(record.job.projectId, `${record.job.id}:${record.job.completed}`))auth.checkArticleAccess(record.job.projectId)
+      record.job.status = 'queued'
+      record.job.cancelRequested=false
+      record.job.error = ''
+      jobJournal.save(record)
+      return json(res, 200, { ok: true, job: startArticleJob(record.body, record) })
     }
     if (req.method === 'POST' && req.url === '/api/articles/generate') {
       const body = await readJson(req)
-      const result = await generateArticleFromPlan(validateGenerationScope(body, getStateValue))
+      const input = generationInput(body)
+      const projectId=currentProjectScope().projectId
+      const fingerprint=createHash('sha256').update(JSON.stringify(input)).digest('hex')
+      if(body.requestId!==undefined && !/^[a-zA-Z0-9_-]{8,100}$/.test(body.requestId))throw Object.assign(new Error('请求编号无效'),{status:400})
+      const key=`direct:${body.requestId || crypto.randomUUID()}`
+      const result=await jobJournal.exclusive(`${projectId}:${key}`,async()=>{
+        const cached=auth.articleResult(projectId,key)
+        if(cached) {
+          if(cached.requestFingerprint!==fingerprint)throw Object.assign(new Error('请求编号已用于其他文章'),{status:409})
+          return cached
+        }
+        if(!currentProjectScope().legacy)auth.checkArticleAccess(projectId)
+        if(!currentProjectScope().legacy && projectId!=='platform' && !body.requestId)throw Object.assign(new Error('请提供唯一请求编号，重试时沿用原编号'),{status:400})
+        const reservation=auth.reserveArticle(projectId,key,fingerprint)
+        try {
+          const generated=await generateArticleFromPlan(input)
+          generated.requestFingerprint=fingerprint
+          auth.settleArticle(reservation,Boolean(generated.ok && generated.articles?.length && generated.articles.every(a=>a.body?.trim() && !a.apiIssues?.length)),generated)
+          return generated
+        } catch(error) { auth.settleArticle(reservation,false);throw error }
+      })
       if (result.articles) result.articles = stampOwnedRows('geo.articleRows', result.articles)
       return json(res, result.ok ? 200 : result.status || 503, result)
     }
@@ -7118,6 +7989,47 @@ async function handleProjectRequest(req, res, account, requestUrl) {
       const result = await expandKeywords(await readJson(req))
       return json(res, result.ok ? 200 : result.status || 503, result)
     }
+    if (req.method === 'GET' && requestUrl.pathname === '/api/media/resources') {
+      if (!roles[account.role].includes('media:publish')) throw scopeError('需要发布权限')
+      const channel = requestUrl.searchParams.get('channel')
+      if (!['social', 'news', 'b2b', 'news2'].includes(channel)) throw scopeError('渠道暂不支持', 400)
+      if (channel === 'news2') {
+        if (!configured('MEITICAIGOU_APP_KEY') || !configured('MEITICAIGOU_BASE_URL')) throw scopeError('媒体采购网尚未配置', 503)
+      } else if (!configured('XIAOQINGWA_KEY') || !configured('XIAOQINGWA_BASE_URL')) throw scopeError('小青蛙尚未配置', 503)
+      const result=mediaCatalog.query(channel,requestUrl.searchParams,{priceFor:currentPriceFor})
+      newsPublishing.remember(result.resources,result.page,channel)
+      return json(res,200,{ok:true,...result})
+    }
+    if (requestUrl.pathname === '/api/media/drafts') {
+      if (!roles[account.role].includes('media:publish')) throw scopeError('需要发布权限')
+      const previous = getStateArray('geo.distributionTasks')
+      if (req.method === 'GET') return json(res, 200, { ok: true, drafts: previous.filter(row => row && typeof row === 'object' && row.brand === requestUrl.searchParams.get('brand') && row.channel === requestUrl.searchParams.get('channel')) })
+      if (req.method === 'POST') {
+        const body = await readJson(req)
+        if (!['social', 'news'].includes(body.channel) || !getStateArray('geo.projectRows').some(r => r.name === body.brand)) throw scopeError('品牌或渠道无效', 400)
+        if (!Array.isArray(body.articles) || !body.articles.length || !Array.isArray(body.resources) || !body.resources.length) throw scopeError('请选择文章与媒体', 400)
+        const owned = getStateArray('geo.articleRows')
+        const articles = body.articles.map(a => {
+          if (!owned.some(r => r.id === a.id && r.project === body.brand && r.status === '已生成')) throw scopeError('文章不属于当前品牌')
+          if (typeof a.title !== 'string' || !a.title.trim() || typeof a.body !== 'string' || !a.body.trim()) throw scopeError('标题和正文不能为空', 400)
+          return { id: a.id, title: a.title, body: a.body }
+        })
+        const resources = body.resources.map(r => {
+          if (!r.resource_id || typeof r.title !== 'string' || !Number.isFinite(Number(r.price)) || Number(r.price) < 0) throw scopeError('媒体资料无效', 400)
+          return { resource_id: r.resource_id, title: r.title, price: String(r.price) }
+        })
+        const allocations = body.allocations === undefined ? resources.map(r => ({ resourceId: r.resource_id, articleIds: articles.map(a => a.id) })) : body.allocations
+        if (!Array.isArray(allocations) || allocations.length !== resources.length) throw scopeError('媒体分配无效', 400)
+        const mediaIds = new Set()
+        for (const allocation of allocations) {
+          if (!allocation || mediaIds.has(String(allocation.resourceId)) || !resources.some(r => String(r.resource_id) === String(allocation.resourceId)) || !Array.isArray(allocation.articleIds) || !allocation.articleIds.length || new Set(allocation.articleIds).size !== allocation.articleIds.length || allocation.articleIds.some(id => !articles.some(a => a.id === id))) throw scopeError('文章与媒体分配无效', 400)
+          mediaIds.add(String(allocation.resourceId))
+        }
+        const draft = { id: crypto.randomUUID(), brand: body.brand, channel: body.channel, status: '待发布', createdAt: new Date().toISOString(), articles, resources, allocations: allocations.map(a => ({ resourceId: a.resourceId, articleIds: a.articleIds })) }
+        setStateArray('geo.distributionTasks', [draft, ...previous])
+        return json(res, 201, { ok: true, draft })
+      }
+    }
     if (req.method === 'POST' && req.url === '/api/media/publish') {
       const result = await publishToMedia(await readJson(req))
       return json(res, result.ok ? 200 : result.status || 503, result)
@@ -7129,6 +8041,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return json(res, 204, {})
   try {
     const requestUrl = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`)
+    if(newsPublishing.publicImage(req,res,requestUrl))return
     if (hasTrustedProjectHeaders(req)) {
       const user = await resolveCurrentUser(req)
       if (req.method === 'GET' && requestUrl.pathname === '/api/projects/summary') {
@@ -7147,7 +8060,7 @@ const server = http.createServer(async (req, res) => {
       return await runInProjectScope(resolveProjectScope(user), () => handleProjectRequest(req, res, account, requestUrl))
     })
   } catch (error) {
-    return json(res, error.status || 500, { ok: false, error: error.message || '服务异常' })
+    return json(res, error.status || 500, { ok: false, error: publicErrorMessage(error) })
   }
 })
 

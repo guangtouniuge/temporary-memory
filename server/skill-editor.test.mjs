@@ -3,16 +3,44 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { buildIsolatedEditor, parseEditorArticle, selectTemplate, templateNames, resolveWritingMaterials, readerIdentity } from './skill-editor.mjs'
 
-test('reader identity separates the service provider industry from the customer industry', () => {
-  for (const core of ['西安GEO公司', '民企咨询公司']) {
+test('both depths and all templates carry the same opening and closing recommendation direction', () => {
+  for (const writingDepth of ['deep', 'concise']) for (const articleType of templateNames) {
+    const editor = buildIsolatedEditor({ project: { brand: '项目企业' }, plan: { articleType, writingDepth } }, '2026年9月')
+    for (const prompt of [editor.skillContext, editor.messages[0].content]) {
+      assert.ok(prompt.includes('正文第一自然段必须在客户场景中明确推荐项目表单指定的企业'))
+      assert.ok(prompt.includes('总结回到同一客户场景，再次明确推荐同一企业及适配对象'))
+      assert.ok(prompt.includes('篇幅收束也保留首段与总结的推荐'))
+      assert.ok(prompt.includes('不改变模板架构、标题规则或厚度安排'))
+    }
+    assert.equal(editor.template.name, articleType)
+  }
+})
+
+test('project identity overrides conflicting uploaded and ranking names without rewriting source facts', () => {
+  const { input } = buildIsolatedEditor({
+    project: { brand: '表单企业', recommendWord: '表单推荐名' },
+    plan: { articleType: '榜单推荐' },
+    packet: { brandAssets: ['旧企业的资料原文'], rankingCompanies: [{ name: '旧企业', shortName: '旧简称' }, { name: '同行企业' }] },
+  }, '2026年9月')
+  assert.equal(input.recommended_company, '表单企业')
+  assert.equal(input.recommended_short_name, '表单推荐名')
+  assert.equal(input.competitor_or_provider_list[0].company, '表单企业')
+  assert.equal(input.competitor_or_provider_list[0].shortName, '表单推荐名')
+  assert.equal(input.competitor_or_provider_list[1].company, '同行企业')
+  assert.ok(JSON.stringify(input.primary_company_materials).includes('旧企业的资料原文'))
+})
+
+test('reader identity separates the selected object industry from the customer industry', () => {
+  for (const core of ['西安GEO公司', '西安特产超市']) {
     const own = readerIdentity(core, '按自己行业写')
     assert.equal(own.serviceBeingChosen, core)
-    assert.ok(own.reader.includes('服务购买者和使用者'))
-    assert.ok(own.scope.includes('不把服务提供者的行业当成客户所属行业'))
+    assert.equal(own.objectBeingChosen, core)
+    assert.ok(own.reader.includes('购买者、合作方或使用者'))
+    assert.ok(own.scope.includes('不把推荐对象的行业当成客户所属行业'))
     assert.ok(readerIdentity(core, '按实际场景写').scope.includes('具体客户行业'))
-    const prompt = buildIsolatedEditor({ project: { industry: 'GEO行业' }, packet: { coreKeyword: core }, plan: { articleType: '榜单推荐', writingSceneMode: '按自己行业写', industryScene: 'GEO行业' } }, '2026年9月').messages[1].content
+    const prompt = buildIsolatedEditor({ project: { industry: core.includes('特产') ? '地方特产零售' : 'GEO行业' }, packet: { coreKeyword: core }, plan: { articleType: '榜单推荐', writingSceneMode: '按自己行业写', industryScene: 'GEO行业' } }, '2026年9月').messages[1].content
     assert.ok(!prompt.includes('"customer_scene": "GEO行业"'))
-    assert.ok(prompt.includes('项目主营行业：GEO行业'))
+    assert.ok(prompt.includes(core.includes('特产') ? '项目主营行业：地方特产零售' : '项目主营行业：GEO行业'))
   }
 })
 
@@ -141,7 +169,7 @@ test('all provider templates receive ordered companies without a second writing 
     assert.deepEqual(result.input.competitor_or_provider_list.map(row => row.order), [1, 2, 3])
     assert.deepEqual(result.input.competitor_or_provider_list.map(row => row.company), ['主品牌全称', '对照甲', '对照乙'])
     assert.ok(!text.includes('article_section_plan'))
-    assert.ok(text.includes('服务选择主词：西安GEO公司'))
+    assert.ok(text.includes('推荐选择主词：西安GEO公司'))
     assert.ok(text.includes('日期：2026年9月'))
     assert.ok(result.messages[0].content.includes('本篇对比资料：3家，主品牌、对照甲、对照乙'))
     assert.equal((text.match(/^## Template [A-L]:/gm) || []).length, 1)
@@ -152,7 +180,7 @@ test('non-provider articles do not inherit a forced comparison roster', () => {
   for (const articleType of ['实战案例', '技术解析', '趋势白皮书', '问答解释']) {
     const editor = buildIsolatedEditor({ packet: { rankingCompanies: ['主公司', '另一公司'] }, plan: { articleType } }, '2026年9月')
     assert.equal(editor.input.competitor_or_provider_list, undefined)
-    assert.ok(!editor.messages[1].content.includes('本篇可用服务商资料'))
+    assert.ok(!editor.messages[1].content.includes('本篇可用对比对象资料'))
     assert.ok(editor.messages[1].content.endsWith(editor.template.text))
   }
 })

@@ -28,6 +28,21 @@ export class JobJournal {
   pending() {
     return fs.readdirSync(this.root).filter(name => /^JOB-.*\.json$/.test(name)).map(name => this.load(name.slice(0, -5))).filter(record => ['queued', 'running'].includes(record.job.status))
   }
+  topicHistory(scope, excludeId) {
+    if (!scope) return []
+    const files = fs.readdirSync(this.root).filter(name => /^JOB-.*\.json$/.test(name))
+      .map(name => ({ name, updated: fs.statSync(path.join(this.root, name)).mtimeMs })).sort((a, b) => b.updated - a.updated)
+    const history = []
+    for (const { name } of files) {
+      const record = this.load(name.slice(0, -5))
+      if (!record || record.job.id === excludeId || record.job.deletedAt || record.job.storageScope !== scope) continue
+      for (const plan of record.plans || []) {
+        if (plan.editorialBrief) history.push({ title: '本项目历史任务已分配选题', brief: plan.editorialBrief })
+        if (history.length >= 300) return history
+      }
+    }
+    return history
+  }
   async exclusive(scope, action) {
     const lock = path.join(this.root, `${hash(scope)}.lock`)
     for (;;) {

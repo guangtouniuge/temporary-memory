@@ -6,7 +6,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/api': 'http://127.0.0.1:8787',
+      // Keep the browser-facing host for the API's same-origin login checks.
+      '/api': { target: 'http://127.0.0.1:8787', changeOrigin: false },
     },
   },
 })

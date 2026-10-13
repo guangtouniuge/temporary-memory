@@ -3,7 +3,7 @@ import { parseDocument, DomUtils } from 'htmlparser2'
 import { articleHtml } from '../server/article-format.mjs'
 import { templateNames } from '../server/skill-editor.mjs'
 
-const base = 'https://geoskill.7chacha.com'
+const base = (await import('./test-target-guard.mjs')).localTestTarget()
 const credentials = JSON.parse(await fs.readFile('.tmp/commercial-credentials.json', 'utf8'))
 if (credentials.projectId !== 'exposure-main') throw new Error('Unexpected project')
 const login = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(credentials.project) })

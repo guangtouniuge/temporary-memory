@@ -21,8 +21,16 @@ export function projectHeaders(): Record<string, string> {
 function cacheKey(key: string) { return `geoskill:${identityKey()}:${key}` }
 // Never hydrate a project account from the pre-account browser cache.
 export const projectStorage = {
-  getItem(key: string) { return window.localStorage.getItem(cacheKey(key)) },
-  setItem(key: string, value: string) { window.localStorage.setItem(cacheKey(key), value) },
+  getItem(key: string) {
+    try { return window.localStorage.getItem(cacheKey(key)) } catch { return null }
+  },
+  setItem(key: string, value: string) {
+    // Browser cache is optional; quota/privacy failures must not block server data.
+    try {
+      if(key==='geo.articleRows')window.localStorage.removeItem(cacheKey(key))
+      else window.localStorage.setItem(cacheKey(key), value)
+    } catch { /* The server remains the source of truth. */ }
+  },
 }
 export async function fetchProjectFile(url: string) {
   const response = await fetch(url, { headers: projectHeaders(), credentials: 'same-origin' })

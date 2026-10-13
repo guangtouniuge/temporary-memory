@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import assert from 'node:assert/strict'
-const base = 'https://geoskill.7chacha.com'
+const base = (await import('./test-target-guard.mjs')).localTestTarget()
 const credentials = JSON.parse(await fs.readFile('.tmp/commercial-credentials.json', 'utf8'))
 let cookie = ''
 async function api(route, body) {

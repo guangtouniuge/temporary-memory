@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import { templateNames } from '../server/skill-editor.mjs'
-const base = 'https://geoskill.7chacha.com'
+const base = (await import('./test-target-guard.mjs')).localTestTarget()
 const out = process.env.GEO_TEST_OUTPUT || 'outputs/all-template-acceptance-20260911'
 await fs.mkdir(out, { recursive: true })
 const credentials = JSON.parse(await fs.readFile('.tmp/commercial-credentials.json', 'utf8'))

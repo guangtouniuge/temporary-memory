@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises'
-const base = 'https://geoskill.7chacha.com'
+const base = (await import('./test-target-guard.mjs')).localTestTarget()
 const out = process.env.GEO_TEST_OUTPUT || 'outputs/api-tests/batch-topics-online'
 const api = async (path, body) => {
   const response = await fetch(base + path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {})

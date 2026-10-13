@@ -16,3 +16,13 @@ test('brand images do not split provider headings or question-answer blocks', ()
 test('article beginning with heading receives image before rather than inside its section', () => {
   assert.ok(insert('## 问答\n\n问：问题\n\n答：答案').body.startsWith('![品牌](/one)\n\n## 问答'))
 })
+
+test('brand gallery images rotate by article instead of always using the first two', () => {
+  const rotatingInsert = new Function('parseGalleryImageItems', code + '\nreturn insertGalleryImagesIntoArticle;')((rows) => rows)
+  const images = ['one', 'two', 'three', 'four', 'five'].map(src => ({ label: '品牌图', src: `/${src}` }))
+  const first = rotatingInsert('文章一导语。\n\n## 正文\n\n内容。', images).imagePaths
+  const second = rotatingInsert('文章二导语。\n\n## 正文\n\n内容。', images).imagePaths
+  assert.notDeepEqual(first, second)
+  assert.equal(first.length, 2)
+  assert.equal(second.length, 2)
+})

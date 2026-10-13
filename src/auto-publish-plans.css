@@ -1,0 +1,482 @@
+.auto-plan-page {
+  display: grid;
+  gap: 14px;
+}
+
+.auto-plan-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border: 1px solid #dfe7ef;
+  border-radius: 8px;
+  padding: 18px 20px;
+  background: #fff;
+}
+
+.auto-plan-eyebrow {
+  display: block;
+  margin-bottom: 6px;
+  color: #167a52;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.auto-plan-hero h2 {
+  margin: 0;
+  color: #102033;
+  font-size: 22px;
+  line-height: 1.2;
+}
+
+.auto-plan-hero p {
+  margin: 7px 0 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.auto-plan-primary-actions,
+.auto-flow-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.auto-plan-layout {
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.auto-plan-list {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+}
+
+.auto-plan-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 6px;
+}
+
+.auto-plan-list-head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.auto-plan-list-head span,
+.auto-plan-list small {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.auto-plan-list button {
+  display: grid;
+  gap: 5px;
+  min-height: 74px;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  padding: 11px;
+  color: #172033;
+  background: #fff;
+  text-align: left;
+}
+
+.auto-plan-list button.active,
+.auto-plan-list button:hover {
+  border-color: #9fceb9;
+  background: #f7fcf9;
+}
+
+.auto-plan-list-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.auto-plan-list-title strong,
+.auto-plan-list span,
+.auto-plan-list small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-plan-list-title em {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: #0f5137;
+  background: #eaf7f0;
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.auto-plan-main {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.auto-plan-flow {
+  display: grid;
+  gap: 16px;
+  padding: 18px 20px;
+}
+
+.auto-flow-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #edf1f5;
+  padding-bottom: 14px;
+}
+
+.auto-flow-head h3 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.auto-flow-head p {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.auto-flow-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.auto-flow-steps li {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 8px;
+  min-height: 54px;
+  border: 1px solid #dfe7ef;
+  border-radius: 7px;
+  padding: 8px 10px;
+  background: #fbfdff;
+}
+
+.auto-flow-steps span,
+.auto-simple-title span {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  color: #fff;
+  background: #167a52;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.auto-flow-steps strong,
+.auto-flow-steps small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-flow-steps strong {
+  font-size: 13px;
+}
+
+.auto-flow-steps small {
+  grid-column: 2;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.auto-simple-section {
+  display: grid;
+  gap: 12px;
+  border-top: 1px solid #edf1f5;
+  padding-top: 16px;
+}
+
+.auto-simple-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.auto-simple-title strong {
+  font-size: 15px;
+}
+
+.auto-simple-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.auto-simple-grid.compact {
+  grid-template-columns: repeat(2, minmax(0, 220px));
+}
+
+.auto-simple-grid label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.auto-simple-grid input,
+.auto-simple-grid select {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 7px 10px;
+  color: #172033;
+  background: #fff;
+  font-weight: 500;
+}
+
+.auto-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.auto-chip-row button {
+  min-height: 32px;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  padding: 0 12px;
+  color: #334155;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.auto-chip-row button[aria-pressed="true"] {
+  border-color: #167a52;
+  color: #0f5137;
+  background: #eaf7f0;
+}
+
+.auto-flow-actions {
+  justify-content: flex-start;
+  border-top: 1px solid #edf1f5;
+  padding-top: 16px;
+}
+
+.auto-plan-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.auto-plan-section-title h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.auto-plan-section-title span {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.auto-day-table {
+  display: grid;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.auto-day-table article {
+  display: grid;
+  grid-template-columns: 148px 72px minmax(0, 1fr) 184px;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #edf1f5;
+  background: #fff;
+}
+
+.auto-day-table article:last-child {
+  border-bottom: 0;
+}
+
+.auto-day-table article:hover {
+  background: #fbfdfb;
+}
+
+.auto-day-table strong,
+.auto-day-table small {
+  display: block;
+}
+
+.auto-day-table strong {
+  font-size: 14px;
+}
+
+.auto-day-table small,
+.auto-day-table em {
+  color: #64748b;
+  font-style: normal;
+  font-size: 12px;
+}
+
+.auto-day-table > article > span {
+  justify-self: start;
+  border-radius: 999px;
+  padding: 4px 9px;
+  color: #0f5137;
+  background: #eaf7f0;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.auto-day-table em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-day-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.auto-day-actions button {
+  min-height: 30px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  color: #1e3a5f;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.auto-plan-runs {
+  display: grid;
+  gap: 8px;
+}
+
+.auto-run-row,
+.auto-draft-row {
+  display: grid;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  border-bottom: 1px solid #edf1f5;
+  font-size: 13px;
+}
+
+.auto-run-row {
+  grid-template-columns: 30px 128px minmax(0, 1fr) 174px;
+}
+
+.auto-draft-row {
+  grid-template-columns: 30px 220px minmax(0, 1fr) 118px;
+}
+
+.auto-run-row:last-child,
+.auto-draft-row:last-child {
+  border-bottom: 0;
+}
+
+.auto-run-row > span,
+.auto-draft-row > span {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  color: #167a52;
+  background: #eaf7f0;
+}
+
+.auto-draft-row div {
+  display: grid;
+  gap: 3px;
+}
+
+.auto-draft-row small,
+.auto-run-row small {
+  color: #64748b;
+}
+
+.auto-run-row em,
+.auto-draft-row em {
+  min-width: 0;
+  overflow: hidden;
+  color: #475569;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-run-row small {
+  text-align: right;
+}
+
+.auto-draft-row button {
+  min-height: 34px;
+  border: 1px solid #9fceb9;
+  border-radius: 6px;
+  color: #0f5137;
+  background: #f7fcf9;
+  font-weight: 800;
+}
+
+@media (max-width: 1280px) {
+  .auto-plan-layout,
+  .auto-simple-grid,
+  .auto-flow-steps {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .auto-simple-grid.compact {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .auto-plan-hero,
+  .auto-flow-head {
+    display: grid;
+  }
+
+  .auto-plan-primary-actions,
+  .auto-flow-actions {
+    justify-content: flex-start;
+  }
+
+  .auto-day-table article,
+  .auto-draft-row,
+  .auto-run-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .auto-run-row small {
+    text-align: left;
+  }
+}

@@ -1,10 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve, relative, isAbsolute } from 'node:path'
+import { readProviderResearch } from './provider-research.mjs'
+import { resolveBusinessScenes } from './business-scenes.mjs'
+import { normalizeWritingScene, isUnifiedScene } from './writing-scene.mjs'
+import { imageSource } from './volcengine-images.mjs'
 
 const context = new AsyncLocalStorage()
 const roles = new Set(['super_admin', 'agent', 'project_admin', 'project_operator'])
-export const stateKeys = new Set(['projectRows', 'articleRows', 'taskRows', 'keywordRows', 'keywordLibraryRows', 'questionRows', 'knowledgeRows', 'knowledgeContentRows', 'galleryRows', 'industrySceneRows', 'rankingCandidateRows', 'confirmedArticlePlans', 'distributionTasks', 'diagnosisCreated', 'activeBrand', 'activeKeyword', 'activeBatchId'].map(key => `geo.${key}`))
+export const stateKeys = new Set(['projectRows', 'projectUnderstandingRows', 'articleRows', 'taskRows', 'keywordRows', 'keywordLibraryRows', 'questionRows', 'knowledgeRows', 'knowledgeContentRows', 'galleryRows', 'industrySceneRows', 'rankingCandidateRows', 'confirmedArticlePlans', 'distributionTasks', 'diagnosisCreated', 'activeBrand', 'activeKeyword', 'activeBatchId'].map(key => `geo.${key}`))
 
 export function scopeError(message, status = 403) {
   return Object.assign(new Error(message), { status })
@@ -111,8 +115,7 @@ export function stampOwnedRows(key, value) {
   })
 }
 
-export function validateGenerationScope(body, readState) {
-  if (currentProjectScope().legacy) return body
+export function validateGenerationScope(body, readState, { allowMissingCore = false } = {}) {
   const { projectId } = currentProjectScope()
   if (body.projectId && body.projectId !== projectId) throw scopeError('不能调用其他项目生成文章')
   const project = (readState('geo.projectRows') || []).find(row => row.name === body.project?.name)
@@ -123,25 +126,38 @@ export function validateGenerationScope(body, readState) {
   const rows = key => (readState(key) || []).filter(row => row[0] === name)
   const core = body.packet?.coreKeyword || project.coreKeyword
   const keywords = rows('geo.keywordRows').map(row => row[1])
-  if (!core || ![...keywords, project.coreKeyword].includes(core)) throw scopeError('核心词不属于当前品牌', 400)
-  const knowledge = rows('geo.knowledgeContentRows')
+  if ((!core && !allowMissingCore) || (core && ![...keywords, project.coreKeyword].includes(core))) throw scopeError('核心词不属于当前品牌', 400)
+  const knowledgeName = body.task?.knowledge ?? body.packet?.knowledgeName ?? ''
+  if (knowledgeName && !rows('geo.knowledgeRows').some(row => row[1] === knowledgeName)) throw scopeError('所选知识库不存在，请重新选择', 400)
+  const knowledge = rows('geo.knowledgeContentRows').filter(row => (!knowledgeName || row[1] === knowledgeName) && (row[3]?.trim() || row[4]?.trim()))
   const candidates = rows('geo.rankingCandidateRows').filter(row => row[6] !== '是')
-  const allowedCandidateText = candidates.slice(0, 4).map(row => {
+  const allowedCandidateText = candidates.map(row => {
     const details = [row[2]?.trim(), row[3]?.trim() ? `适合${row[3].trim()}` : '', row[4]?.trim() ? `优势${row[4].trim()}` : '', row[5]?.trim() ? `核验${row[5].trim()}` : ''].filter(Boolean)
     return details.length ? `${row[1]}：${details.join('；')}` : row[1]
   }).join('\n')
+  const sceneConfig=normalizeWritingScene(body.task,body.packet,project)
+  const sceneMode=sceneConfig.writingSceneMode
+  const businessScenes=resolveBusinessScenes(rows('geo.keywordLibraryRows'),name,core,body.task?.businessScenes ?? body.packet?.businessScenes,sceneMode)
   const packet = {
-    ...body.packet, project, coreKeyword: core,
-    keywords: [core, ...rows('geo.keywordLibraryRows').filter(row => row[1] === core).map(row => row[2])],
+      imageSource:imageSource(body.task?.imageSource ?? body.packet?.imageSource),
+      businessScenes,
+      project, coreKeyword: core,
+      articleType: body.task?.articleType ?? body.packet?.articleType ?? '',
+      ...sceneConfig,
+      sceneHints: isUnifiedScene(sceneMode) ? rows('geo.keywordLibraryRows').filter(row=>row[1]===core&&row[3]==='场景业务词'&&row[4]!=='已停用').map(row=>row[2]) : undefined,
+      writingDepth: body.task?.writingDepth ?? body.plan?.writingDepth ?? body.packet?.writingDepth ?? 'deep',
+      knowledgeName,
+      materialSources: knowledge.map(row => ({ library: row[1], name: row[2] })),
+    keywords: [core, ...rows('geo.keywordLibraryRows').filter(row => row[1] === core && (row[3]!=='场景业务词'||businessScenes.includes(row[2]))).map(row => row[2])],
     questions: rows('geo.questionRows').filter(row => row.length >= 5 && row[1] === core).map(row => row[2]),
-    brandAssets: knowledge.map(row => `${row[2]}：${row[3]}`),
-    authorityEvidence: knowledge.map(row => `${row[2]}：${row[4]}`),
-    galleries: rows('geo.galleryRows').map(row => `${row[1]}（${row[2]}，${row[3]}${row[5] ? `，文件：${row[5]}` : ''}）`),
+      brandAssets: knowledge.filter(row => row[3]?.trim()).map(row => `${row[2]}：${row[3]}`),
+      authorityEvidence: knowledge.filter(row => row[4]?.trim()).map(row => `${row[2]}：${row[4]}`),
+    galleries: imageSource(body.task?.imageSource ?? body.packet?.imageSource)==='ai'?[]:rows('geo.galleryRows').filter(row=>row[7]!=='ai').map(row => `${row[1]}（${row[2]}，${row[3]}${row[5] ? `，文件：${row[5]}` : ''}）`),
     providerList: allowedCandidateText,
     rankingCompanies: [
       { rank: 1, name: project.brand || project.name, shortName: project.recommendWord || project.brand },
-      ...candidates.slice(0, 4).map((row, index) => ({ rank: index + 2, name: row[1], note: [row[2], row[3], row[4], row[5]].filter(Boolean).join('；') })),
+        ...candidates.map((row, index) => ({ rank: index + 2, name: row[1], note: [row[2], row[3], row[4], row[5]].filter(Boolean).join('；'), publicResearch: readProviderResearch(row) })),
     ],
   }
-  return { ...body, project, packet, task: { ...body.task, providerList: allowedCandidateText }, projectId }
+  return { ...body, project, packet, task: { ...body.task, ...sceneConfig, providerList: allowedCandidateText }, projectId }
 }

@@ -12,10 +12,10 @@ config = '/etc/nginx/conf.d/geoskill.7chacha.com.conf'
 with tarfile.open('deploy/commercial-ui-cleanup.tgz') as archive:
     index = archive.extractfile('dist/index.html').read().decode()
     assets = re.findall(r'(?:src|href)="(/[^"?#]+\.(?:js|css))"', index)
-    if not assets or any(not path.startswith('/assets/') for path in assets):
-        raise RuntimeError('Commercial UI must be built with npm run build -- --base=/')
+    if not assets or any(not path.startswith(('/assets/', '/gongju/assets/')) for path in assets):
+        raise RuntimeError('Unexpected UI asset base')
     for path in assets:
-        archive.getmember(str(PurePosixPath('dist') / path.lstrip('/')))
+        archive.getmember(str(PurePosixPath('dist') / path.removeprefix('/gongju').lstrip('/')))
 
 client = paramiko.SSHClient()
 client.load_system_host_keys()
@@ -31,6 +31,9 @@ def run(command):
 original = None
 changed = False
 try:
+    free = int(run("df -B1 --output=avail / | tail -n 1").strip())
+    if free < 2 * 1024**3:
+        raise RuntimeError('Server disk below 2 GiB free; deployment stopped')
     run('systemctl is-active --quiet geoskill-commercial-api.service')
     with client.open_sftp() as sftp:
         with sftp.file(config) as f:
@@ -44,7 +47,7 @@ try:
     with client.open_sftp() as sftp:
         sftp.put('deploy/commercial-ui-cleanup.tgz', release + '/ui.tgz')
     run(f'tar -xzf {release}/ui.tgz -C {release} && test -f {release}/dist/index.html')
-    updated = re.sub(r'\broot\s+[^;]+;', 'root ' + release + '/dist;', original)
+    updated = re.sub(re.escape(root) + r'/releases/[^/;\s]+/dist', release + '/dist', original)
     with client.open_sftp() as sftp:
         changed = True
         with sftp.file(config, 'w') as f:
