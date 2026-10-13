@@ -24,13 +24,14 @@ const cancellableStates=new Set(['quoted','scheduled','reserved'])
 const executingStates=new Set(['reserved','sending','uncertain','submitted'])
 const recordStates=new Set(['linked','refunded','cancelled'])
 const defaultFavoriteFolder='默认收藏夹'
+const brandNamesFromArticles=(articles:Article[],fallback:string)=>[...new Set([fallback,...articles.map(a=>a.project||'')].filter(Boolean))]
 function stateLabel(o:NewsOrder){
   if(o.state!=='submitted'||o.providerStatus===undefined)return orderState[o.state]||o.state
   const states:Record<number,string>=o.providerChannel==='news2'?{1001:'已安排',1002:'已发稿',1004:'已退稿',1005:'退单申请',1006:'改稿中',1011:'已提交'}:o.providerChannel==='b2b'?{0:'发布中',1:'已发稿',2:'退款待核实',3:'售后中',4:'已安排'}:{0:'已提交',1:'已安排',2:'已发稿',4:'已退稿，待退款',9:'售后中'}
   return states[o.providerStatus]||'平台状态待核实'
 }
-export function MediaWorkspace({ channel:inputChannel, articles:initialArticles, brand:initialBrand, initialIds, request, queueOnly=false, initialView, headingTitle }: {
-  channel: MediaChannel; articles: Article[]; brand: string; initialIds: string[]; request: Request; queueOnly?: boolean; initialView?: string; headingTitle?: string
+export function MediaWorkspace({ channel:inputChannel, articles:initialArticles, brand:initialBrand, initialIds, request, queueOnly=false, initialView, headingTitle, contentReady=true }: {
+  channel: MediaChannel; articles: Article[]; brand: string; initialIds: string[]; request: Request; queueOnly?: boolean; initialView?: string; headingTitle?: string; contentReady?: boolean
 }) {
   const channel=inputChannel
   const [resourceChannel,setResourceChannel]=useState<MediaChannel>(inputChannel)
@@ -38,8 +39,8 @@ export function MediaWorkspace({ channel:inputChannel, articles:initialArticles,
   const channelOrders=(orders:NewsOrder[])=>queueOnly?orders.filter(o=>['news','news2','social','b2b'].includes(o.channel||'news')):orders.filter(o=>inputChannel==='news'?['news','social','b2b'].includes(o.channel||'news'):(o.channel||'news')===inputChannel)
   const [articles,setArticles]=useState(initialArticles)
   const [brand,setBrand]=useState(initialBrand)
-  const [brands,setBrands]=useState<string[]>([])
-  const [contentLoading,setContentLoading]=useState(channel!=='video')
+  const [brands,setBrands]=useState<string[]>(()=>brandNamesFromArticles(initialArticles,initialBrand))
+  const [contentLoading,setContentLoading]=useState(false)
   const [newsOrders,setNewsOrders]=useState<NewsOrder[]>([])
   const [quote,setQuote]=useState<NewsOrder[]>([])
   const [funding,setFunding]=useState<Funding|null>(null)
@@ -100,11 +101,17 @@ export function MediaWorkspace({ channel:inputChannel, articles:initialArticles,
   const [newFolder,setNewFolder]=useState('')
   const reloadContent=async()=>{
     setContentLoading(true)
-    try {const r=await request<{articles:Article[];brands:string[]}>('/api/news/content');setArticles(r.articles);setBrands(r.brands);setBrand(b=>r.brands.includes(b)?b:r.brands[0]||'')}
+    try {const r=await request<{articles:Article[];brands:string[]}>(`/api/news/content?brand=${encodeURIComponent(brand)}`);setArticles(r.articles);setBrands(r.brands);setBrand(b=>r.brands.includes(b)?b:r.brands[0]||'')}
     catch(e){const text=e instanceof Error?e.message:'';setMessage(text==='Failed to fetch'?'文章加载失败，请刷新页面或重新登录后再试':text||'成品库读取失败')}
     finally{setContentLoading(false)}
   }
-  useEffect(()=>{if(channel!=='video')void reloadContent();else setArticles(initialArticles)},[initialArticles])
+  useEffect(()=>{
+    setArticles(initialArticles)
+    const nextBrands=brandNamesFromArticles(initialArticles,initialBrand)
+    setBrands(nextBrands)
+    setBrand(b=>nextBrands.includes(b)?b:nextBrands[0]||'')
+    if(contentReady&&channel!=='video'&&!initialBrand&&!initialArticles.length)void reloadContent()
+  },[initialArticles,initialBrand,contentReady])
   const eligible = articles.filter(a => a.project === brand && a.status === '已生成' && a.body?.trim())
   const selected = eligible.filter(a => ids.includes(a.id))
   const visible = eligible.filter(a => a.title.includes(query))
@@ -261,7 +268,10 @@ export function MediaWorkspace({ channel:inputChannel, articles:initialArticles,
   const title = headingTitle || (inputChannel==='b2b'?'补充媒体投喂':channel === 'social' ? '自有媒体投喂' : channel === 'news2' ? '核心媒体投喂' : channel === 'news' ? '补充媒体投喂' : '视频')
   const loadDrafts = async () => {
     if(channel==='video')return
-    const r=await request<{orders:NewsOrder[]}>('/api/news/orders');setNewsOrders(channelOrders(r.orders));setRecordsLoaded(true)
+    if(!brand){setRecordsLoaded(false);return}
+    const channels=queueOnly?'news,news2,social,b2b':inputChannel==='news'?'news,social,b2b':inputChannel
+    const params=new URLSearchParams({brand,channels})
+    const r=await request<{orders:NewsOrder[]}>(`/api/news/orders?${params}`);setNewsOrders(channelOrders(r.orders));setRecordsLoaded(true)
     if(channel!=='social')return
     const results = await Promise.all(['social'].map(c => request<{ drafts: Draft[] }>(`/api/media/drafts?brand=${encodeURIComponent(brand)}&channel=${c}`)))
     setDrafts(results.flatMap(r => r.drafts)); setRecordsLoaded(true)
@@ -326,9 +336,12 @@ export function MediaWorkspace({ channel:inputChannel, articles:initialArticles,
     }catch(e){setMessage(e instanceof Error?e.message:'报价失败')}finally{setBusy(false);setQuoting(false)}
   }
   const refreshOrders=async()=>{
+    if(!brand)return
     setBusy(true);setMessage('')
     try{
-      const latest=await request<{orders:NewsOrder[]}>('/api/news/orders')
+      const channels=queueOnly?'news,news2,social,b2b':inputChannel==='news'?'news,social,b2b':inputChannel
+      const params=new URLSearchParams({brand,channels})
+      const latest=await request<{orders:NewsOrder[]}>(`/api/news/orders?${params}`)
       const rows=channelOrders(latest.orders).filter(o=>o.brand===brand)
       const ids=rows.filter(o=>o.orderId&&o.state!=='refunded').slice(0,100).map(o=>o.id)
       if(!ids.length){setNewsOrders(channelOrders(latest.orders));setRecordsLoaded(true);return}

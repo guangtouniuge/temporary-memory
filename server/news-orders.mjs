@@ -47,7 +47,21 @@ export function createNewsOrders(sql,{transact,update,balance}) {
       const found=sql.prepare("SELECT a.value FROM news_orders n,json_each(n.data,'$.assets') a WHERE n.state IN ('scheduled','sending','uncertain','submitted','linked','refunded') AND json_extract(a.value,'$.token')=? LIMIT 1").get(token)
       return found?JSON.parse(found.value):null
     },
-    list(owner){return sql.prepare('SELECT * FROM news_orders WHERE owner=? ORDER BY rowid DESC').all(owner).map(r=>safe({...r,data:JSON.parse(r.data)})).filter(r=>!r.deletedAt)},
+    list(owner,filters={}){
+      const where=['owner=?'],params=[owner]
+      if(typeof filters.brand==='string'&&filters.brand.trim()){
+        where.push("json_extract(data,'$.brand')=?")
+        params.push(filters.brand.trim())
+      }
+      if(Array.isArray(filters.channels)&&filters.channels.length){
+        const channels=[...new Set(filters.channels.map(channel=>String(channel||'').trim()).filter(Boolean))].slice(0,8)
+        if(channels.length){
+          where.push(`COALESCE(json_extract(data,'$.channel'),'news') IN (${channels.map(()=>'?').join(',')})`)
+          params.push(...channels)
+        }
+      }
+      return sql.prepare(`SELECT * FROM news_orders WHERE ${where.join(' AND ')} ORDER BY rowid DESC`).all(...params).map(r=>safe({...r,data:JSON.parse(r.data)})).filter(r=>!r.deletedAt)
+    },
     expireStale(owner,now=Date.now(),ageMs=stalePublicationAgeMs){return transact(()=>{
       const rows=sql.prepare("SELECT * FROM news_orders WHERE owner=? AND state IN ('quoted','scheduled','reserved','sending','uncertain','submitted')").all(owner)
       const expired=[]

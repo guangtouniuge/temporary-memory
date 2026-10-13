@@ -64,9 +64,21 @@ export function createNewsPublishing({auth,readState,scope,readJson,json,priceFo
       if(!url.pathname.startsWith('/api/news/'))return false
       if(!['super_admin','agent','project_admin'].includes(account.role))fail(403,'需要发布权限')
       const articles=()=>readState('geo.articleRows').filter(a=>a.status==='已生成' && typeof a.body==='string' && a.body.trim())
-      if(req.method==='GET'&&url.pathname==='/api/news/content'){json(res,200,{ok:true,articles:articles(),brands:readState('geo.projectRows').map(p=>p.name)});return true}
+      const listFilters=()=>({
+        brand:String(url.searchParams.get('brand')||'').trim(),
+        channels:String(url.searchParams.get('channels')||'').split(',').map(v=>v.trim()).filter(Boolean),
+      })
+      if(req.method==='GET'&&url.pathname==='/api/news/content'){
+        const brand=String(url.searchParams.get('brand')||'').trim()
+        const all=articles()
+        json(res,200,{ok:true,articles:brand?all.filter(a=>a.project===brand):all,brands:readState('geo.projectRows').map(p=>p.name)});return true
+      }
       const {owner,store}=auth.newsOrders(scope().projectId)
-      if(req.method==='GET'&&url.pathname==='/api/news/orders'){store.expireAllStale();processDueScheduled(owner,store);json(res,200,{ok:true,orders:store.list(owner)});return true}
+      if(req.method==='GET'&&url.pathname==='/api/news/orders'){
+        store.expireStale(owner)
+        processDueScheduled(owner,store)
+        json(res,200,{ok:true,orders:store.list(owner,listFilters())});return true
+      }
       if(req.method!=='POST')fail(405,'请求方法不支持')
       const body=await readJson(req)
       if(url.pathname==='/api/news/quote'){
