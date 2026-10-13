@@ -7311,6 +7311,18 @@ function standardDiagnosisReportHtml(task) {
       <span>${mentioned ? '正面提及率' : errored ? '查询完成率' : '品牌提及率'}</span>
     </div>`
   }).join('')
+  const negativeModelCards = results.map((item, index) => {
+    const result = item.result || {}
+    const mentioned = Number(result.status) === 1
+    const errored = Number(result.status) === 3 || item.refunded
+    const percent = mentioned ? 0 : 100
+    const tone = mentioned ? 'grad-wenxin text-wenxin' : errored ? 'grad-negative text-red' : 'grad-negative text-red'
+    return `<div class="model-stat ${tone}">
+      <p>${escapeHtml(item.platformName || item.platform || `模型${index + 1}`)}</p>
+      <strong>${percent}%</strong>
+      <span>${mentioned ? '未发现负面' : errored ? '查询失败风险' : '未收录风险'}</span>
+    </div>`
+  }).join('')
   const positiveAnalysisRows = results.map(item => {
     const result = item.result || {}
     const mentioned = Number(result.status) === 1
@@ -7320,6 +7332,24 @@ function standardDiagnosisReportHtml(task) {
       <td><span class="mini-tag ${mentioned ? 'ok' : 'warn'}">${mentioned ? '是' : '否'}</span></td>
       <td>${escapeHtml(mentioned ? '品牌已出现在模型回答中' : status)}</td>
       <td>${escapeHtml(result.hit_word || keywordText || '-')}</td>
+    </tr>`
+  }).join('')
+  const negativeAnalysisRows = results.map(item => {
+    const result = item.result || {}
+    const mentioned = Number(result.status) === 1
+    const errored = Number(result.status) === 3 || item.refunded
+    const status = item.statusLabel || diagnosisStatus(result).label
+    const risk = mentioned ? '低' : errored ? '待复查' : '高'
+    const reason = mentioned
+      ? '当前提问下已有品牌信号，暂未构成负面风险。'
+      : errored
+        ? '本次查询失败或已退款，需要复查接口结果后再判断。'
+        : '模型回答中没有形成品牌推荐，容易被竞品或泛泛答案替代。'
+    return `<tr>
+      <td>${escapeHtml(result.question || questionText)}</td>
+      <td><span class="mini-tag ${mentioned ? 'ok' : 'warn'}">${escapeHtml(risk)}</span></td>
+      <td>${escapeHtml(status)}</td>
+      <td>${escapeHtml(reason)}</td>
     </tr>`
   }).join('')
   const sourceRankRows = results.map((item, index) => {
@@ -7341,6 +7371,8 @@ function standardDiagnosisReportHtml(task) {
     const share = safeUrl(result.share_url)
     const image = safeUrl(result.img_url)
     const bar = mentioned ? 100 : 0
+    const riskBar = mentioned ? 0 : 100
+    const evidenceLinks = `${share ? `<a href="${escapeHtml(share)}" target="_blank" rel="noopener noreferrer">对话</a>` : '-'} ${image ? `<a href="${escapeHtml(image)}" target="_blank" rel="noopener noreferrer">截图</a>` : ''}`
     return `<section class="section model-section">
       <h2 class="toc-title">${name}<span class="${mentioned ? 'green' : 'red'}">${mentioned ? '正面' : '未收录'}</span>数据分析</h2>
       <div class="chart-block">
@@ -7359,7 +7391,27 @@ function standardDiagnosisReportHtml(task) {
             <td>${escapeHtml(result.question || questionText)}</td>
             <td><span class="mini-tag ${mentioned ? 'ok' : 'warn'}">${mentioned ? '是' : '否'}</span></td>
             <td>${escapeHtml(item.statusLabel || diagnosisStatus(result).label)}</td>
-            <td>${share ? `<a href="${escapeHtml(share)}" target="_blank" rel="noopener noreferrer">对话</a>` : '-'} ${image ? `<a href="${escapeHtml(image)}" target="_blank" rel="noopener noreferrer">截图</a>` : ''}</td>
+            <td>${evidenceLinks}</td>
+          </tr></tbody>
+        </table>
+      </div>
+      <div class="chart-block negative">
+        <div class="chart-title">${name} 负面质疑期风险对比</div>
+        <div class="bar-chart">
+          <div class="bar-item"><div class="bar-value">${riskBar}%</div><div class="bar danger" style="height:${Math.max(8, riskBar * 1.6)}px"></div><span>未收录风险</span></div>
+          <div class="bar-item"><div class="bar-value">${100 - bar}%</div><div class="bar secondary" style="height:${Math.max(8, (100 - bar) * 1.6)}px"></div><span>补强空间</span></div>
+          <div class="bar-item"><div class="bar-value">${evidenceRate}%</div><div class="bar third" style="height:${Math.max(8, evidenceRate * 1.6)}px"></div><span>证据链</span></div>
+        </div>
+      </div>
+      <div class="data-card">
+        <h3>${name} - 负面质疑期基础数据</h3>
+        <table class="analysis-table">
+          <thead><tr><th>提问词</th><th>风险</th><th>模型反馈</th><th>处理方向</th></tr></thead>
+          <tbody><tr>
+            <td>${escapeHtml(result.question || questionText)}</td>
+            <td><span class="mini-tag ${mentioned ? 'ok' : 'warn'}">${mentioned ? '低' : '高'}</span></td>
+            <td>${escapeHtml(item.statusLabel || diagnosisStatus(result).label)}</td>
+            <td>${escapeHtml(mentioned ? '保持当前品牌事实与信源更新，继续观察。' : '补充权威信源、问答内容和品牌事实页，避免AI回答缺少推荐依据。')}</td>
           </tr></tbody>
         </table>
       </div>
@@ -7383,16 +7435,18 @@ function standardDiagnosisReportHtml(task) {
     .wrap{max-width:1240px;margin:0 auto;padding:34px 20px 70px;}
     .section{margin-bottom:28px;background:var(--light);border:1px solid var(--border);border-radius:14px;padding:24px 26px;box-shadow:0 8px 24px rgba(15,23,42,.04)}
     .title{display:flex;align-items:center;margin:0 0 22px;font-size:20px;font-weight:900;line-height:1.2}.title:before{content:"";width:5px;height:22px;border-radius:999px;background:linear-gradient(180deg,var(--primary),var(--secondary));margin-right:12px;flex:0 0 auto}
-    .overview{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:stretch}.overview-card,.model-stat{border:1px solid var(--border);border-radius:12px;padding:18px;background:#fff}.overview-card{min-height:116px;display:flex;flex-direction:column;justify-content:center}.overview-card p,.model-stat p{margin:0 0 8px;color:var(--sub);font-size:13px;font-weight:800}.overview-card strong{font-size:19px;line-height:1.45}.overview-card span{color:#475569;line-height:1.7}
+    .overview{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:stretch}.overview-card,.model-stat,.signal-card{border:1px solid var(--border);border-radius:12px;padding:18px;background:#fff}.overview-card{min-height:116px;display:flex;flex-direction:column;justify-content:center}.overview-card p,.model-stat p,.signal-card p{margin:0 0 8px;color:var(--sub);font-size:13px;font-weight:800}.overview-card strong{font-size:19px;line-height:1.45}.overview-card span{color:#475569;line-height:1.7}
+    .signal-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-top:18px}.signal-card strong{display:block;font-size:28px;line-height:1.1}.signal-card span{display:block;color:#475569;font-size:13px;margin-top:6px;line-height:1.6}.conclusion{margin-top:18px;border-radius:14px;border:1px solid rgba(79,70,229,.18);background:linear-gradient(135deg,rgba(79,70,229,.08),rgba(255,255,255,.9));padding:18px 20px}.conclusion h3{margin:0 0 8px;font-size:18px}.conclusion p{margin:0;color:#475569;line-height:1.8}
     .grad-data1{background:linear-gradient(180deg,rgba(6,182,212,.11),rgba(6,182,212,.03));border-color:rgba(6,182,212,.25)}.grad-data2{background:linear-gradient(180deg,rgba(139,92,246,.12),rgba(139,92,246,.03));border-color:rgba(139,92,246,.25)}.grad-data3{background:linear-gradient(180deg,rgba(16,185,129,.12),rgba(16,185,129,.03));border-color:rgba(16,185,129,.25)}
     .score-box{display:grid;grid-template-columns:178px minmax(0,620px);justify-content:center;align-items:center;gap:30px;text-align:left}.ring{width:178px;height:178px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#ff9500 var(--score),#E2E8F0 0)}.ring-inner{width:132px;height:132px;border-radius:50%;background:#fff;display:grid;place-items:center;text-align:center}.ring-inner strong{font-size:42px;line-height:1}.ring-inner span{display:block;color:var(--sub);margin-top:4px}
     .model-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;align-items:stretch}.model-stat{text-align:center;min-height:116px;display:flex;flex-direction:column;justify-content:center}.model-stat strong{font-size:26px;display:block;margin-bottom:4px;line-height:1}.model-stat span{color:var(--sub);font-size:12px}.grad-deepseek{background:linear-gradient(180deg,rgba(79,70,229,.12),rgba(79,70,229,.03));border-color:rgba(79,70,229,.25)}.grad-wenxin{background:linear-gradient(180deg,rgba(16,185,129,.12),rgba(16,185,129,.03));border-color:rgba(16,185,129,.25)}.grad-negative{background:linear-gradient(180deg,rgba(239,68,68,.10),rgba(239,68,68,.03));border-color:rgba(239,68,68,.22)}.text-deepseek{color:var(--deepseek)}.text-wenxin{color:var(--wenxin)}.text-red{color:#ef4444}
     .toc-title{text-align:center;font-size:26px;font-weight:900;color:var(--primary);padding-bottom:16px;margin:0 0 22px;border-bottom:2px solid #eee}.toc-title .green{color:#22c55e}.toc-title .red{color:#ef4444}
     .model-section{background:#fff}.model-section .toc-title{margin-bottom:20px}
-    .chart-block{margin-top:0;padding:18px 22px;background:linear-gradient(180deg,#f0fdfa,#fff);border-radius:12px;border:1px solid #cfe8df}.chart-title{text-align:center;font-weight:900;margin-bottom:12px}.bar-chart{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:end;height:190px;padding:0 28px 12px;border-bottom:1px solid #cbd5e1}.bar-item{display:flex;flex-direction:column;align-items:center;height:100%;justify-content:flex-end;min-width:0}.bar-value{font-size:13px;color:#475569;margin-bottom:6px;font-weight:800}.bar{width:44px;min-height:8px;background:#4F46E5;border-radius:7px 7px 0 0}.bar.secondary{background:#10B981}.bar.third{background:#F59E0B}.bar-item span{margin-top:8px;font-size:12px;color:#334155;text-align:center;max-width:120px;line-height:1.35}
+    .chart-block{margin-top:0;padding:18px 22px;background:linear-gradient(180deg,#f0fdfa,#fff);border-radius:12px;border:1px solid #cfe8df}.chart-block.negative{margin-top:18px;background:linear-gradient(180deg,#fff1f2,#fff);border-color:#fecdd3}.chart-title{text-align:center;font-weight:900;margin-bottom:12px}.bar-chart{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:end;height:190px;padding:0 28px 12px;border-bottom:1px solid #cbd5e1}.bar-item{display:flex;flex-direction:column;align-items:center;height:100%;justify-content:flex-end;min-width:0}.bar-value{font-size:13px;color:#475569;margin-bottom:6px;font-weight:800}.bar{width:44px;min-height:8px;background:#4F46E5;border-radius:7px 7px 0 0}.bar.secondary{background:#10B981}.bar.third{background:#F59E0B}.bar.danger{background:#EF4444}.bar-item span{margin-top:8px;font-size:12px;color:#334155;text-align:center;max-width:120px;line-height:1.35}
     .data-card{margin-top:16px}.data-card h3{font-size:16px;margin:0 0 10px;color:#0f172a}table{width:100%;border-collapse:collapse;background:#fff;font-size:14px;table-layout:fixed}th,td{border:1px solid #ddd;padding:10px 12px;text-align:center;vertical-align:middle;line-height:1.5}th{background:#f8fafc;font-weight:900}.analysis-table th:first-child,.analysis-table td:first-child{text-align:left;width:45%}.analysis-table th:nth-child(2),.analysis-table td:nth-child(2){width:82px}.analysis-table th:nth-child(3),.analysis-table td:nth-child(3){width:148px}.analysis-table th:nth-child(4),.analysis-table td:nth-child(4){text-align:left;width:auto}.source-table th:first-child,.source-table td:first-child{width:80px}.source-table th:nth-child(2),.source-table td:nth-child(2){width:220px}.source-table th:nth-child(3),.source-table td:nth-child(3),.source-table th:nth-child(4),.source-table td:nth-child(4){width:180px}.source-table th:last-child,.source-table td:last-child{text-align:center}.mini-tag{display:inline-flex;align-items:center;justify-content:center;min-width:32px;border-radius:999px;padding:5px 10px;font-size:12px;font-weight:900}.mini-tag.ok{background:#dcfce7;color:#166534}.mini-tag.warn{background:#fee2e2;color:#991b1b}a{color:#2563eb;font-weight:800;text-decoration:none}
-    .suggest-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.suggest{border-radius:16px;border:1px solid #cfe8df;background:linear-gradient(180deg,#f0fdfa,#fff);padding:20px}.suggest.blue{border-color:#bfdbfe;background:linear-gradient(180deg,#eff6ff,#fff)}.suggest h3{margin:0 0 12px;font-size:18px}.suggest ul{margin:0;padding-left:20px;line-height:1.9;color:#334155}.footer{text-align:center;color:#64748b;font-size:12px;margin-top:26px}
-    @media(max-width:900px){.overview,.model-stats,.suggest-grid{grid-template-columns:1fr}.score-box{flex-direction:column;text-align:center}.wrap{padding-left:0;padding-right:0}.section{border-radius:0;border-left:0;border-right:0}.table-wrap{overflow:auto}table{min-width:880px}}
+    .model-card-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-top:16px}.model-card{border-radius:14px;border:1px solid var(--border);background:#fff;padding:16px}.model-card.ok{border-color:#bbf7d0;background:#f0fdf4}.model-card.warn{border-color:#fed7aa;background:#fff7ed}.model-card.bad{border-color:#fecdd3;background:#fff1f2}.model-top{display:flex;align-items:center;gap:10px;margin-bottom:12px}.model-icon{width:34px;height:34px;border-radius:10px;background:#312e81;color:#fff;display:grid;place-items:center;font-size:12px;font-weight:900}.model-status{font-weight:900;color:#0f172a;margin-bottom:8px}.model-card p{color:#475569;font-size:13px;line-height:1.6;margin:0 0 12px}.model-links{display:flex;gap:8px;flex-wrap:wrap}.model-links span,.model-links a{font-size:12px;border-radius:999px;background:#f8fafc;border:1px solid #e2e8f0;padding:5px 9px}
+    .suggest-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.suggest{border-radius:16px;border:1px solid #cfe8df;background:linear-gradient(180deg,#f0fdfa,#fff);padding:20px}.suggest.blue{border-color:#bfdbfe;background:linear-gradient(180deg,#eff6ff,#fff)}.suggest h3{margin:0 0 12px;font-size:18px}.suggest ul{margin:0;padding-left:20px;line-height:1.9;color:#334155}.strategy-tags{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}.strategy-tags span{border-radius:999px;padding:8px 12px;background:#ecfdf5;border:1px solid #bbf7d0;color:#166534;font-size:13px;font-weight:800}.action-table{margin-top:20px}.action-table th:first-child,.action-table td:first-child{width:72px}.action-table th:nth-child(2),.action-table td:nth-child(2){width:190px}.footer{text-align:center;color:#64748b;font-size:12px;margin-top:26px}
+    @media(max-width:900px){.overview,.model-stats,.suggest-grid,.signal-strip,.model-card-grid{grid-template-columns:1fr}.score-box{grid-template-columns:1fr;text-align:center;justify-items:center}.wrap{padding-left:0;padding-right:0}.section{border-radius:0;border-left:0;border-right:0}.table-wrap{overflow:auto}table{min-width:880px}}
   </style>
 </head>
 <body>
@@ -7412,6 +7466,16 @@ function standardDiagnosisReportHtml(task) {
         <div class="overview-card grad-data2"><p>核心产品</p><span>${escapeHtml(keywordText)}</span></div>
         <div class="overview-card grad-data3"><p>评级</p><strong>${escapeHtml(grade)}</strong><span> · ${escapeHtml(signalLevel)}</span></div>
       </div>
+      <div class="signal-strip">
+        <div class="signal-card"><p>诊断模型</p><strong>${total}</strong><span>本次覆盖的平台数量</span></div>
+        <div class="signal-card"><p>已收录</p><strong>${collected}</strong><span>能识别并推荐品牌</span></div>
+        <div class="signal-card"><p>未收录</p><strong>${uncollected}</strong><span>需要继续补充信源</span></div>
+        <div class="signal-card"><p>证据链</p><strong>${evidenceCount}</strong><span>包含对话或截图链接</span></div>
+      </div>
+      <div class="conclusion">
+        <h3>${escapeHtml(conclusionTitle)}</h3>
+        <p>${escapeHtml(conclusionText)}</p>
+      </div>
     </section>
     <section class="section">
       <h2 class="title">AI搜索诊断综合得分</h2>
@@ -7427,6 +7491,7 @@ function standardDiagnosisReportHtml(task) {
     <section class="section">
       <h2 class="toc-title">主流大模型<span class="green">正面</span>品牌分析</h2>
       <div class="model-stats">${modelPercentCards || '<p>暂无模型数据</p>'}</div>
+      <div class="model-card-grid">${modelCards || '<p>暂无模型证据。</p>'}</div>
     </section>
     <section class="section">
       <h2 class="toc-title">主流大模型竞品数据对比</h2>
@@ -7443,6 +7508,28 @@ function standardDiagnosisReportHtml(task) {
         <table class="source-table">
           <thead><tr><th>排名</th><th>平台</th><th>对话链接</th><th>截图证据</th><th>状态</th></tr></thead>
           <tbody>${sourceRankRows || '<tr><td colspan="5">暂无引用源数据。</td></tr>'}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section">
+      <h2 class="toc-title">主流大模型<span class="red">负面</span>品牌分析</h2>
+      <div class="model-stats">${negativeModelCards || '<p>暂无模型数据</p>'}</div>
+    </section>
+    <section class="section">
+      <h2 class="toc-title">主流大模型竞品数据对比</h2>
+      <div class="table-wrap data-card">
+        <table class="analysis-table">
+          <thead><tr><th>提问词</th><th>风险等级</th><th>反馈结果</th><th>风险说明</th></tr></thead>
+          <tbody>${negativeAnalysisRows || '<tr><td colspan="4">暂无负面分析数据。</td></tr>'}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section">
+      <h2 class="toc-title">引用源平台排行榜</h2>
+      <div class="table-wrap data-card">
+        <table class="source-table">
+          <thead><tr><th>排名</th><th>平台</th><th>诊断词</th><th>证据状态</th><th>对话链接</th><th>截图证据</th></tr></thead>
+          <tbody>${sourceRows || '<tr><td colspan="6">暂无引用源数据。</td></tr>'}</tbody>
         </table>
       </div>
     </section>
@@ -7466,6 +7553,18 @@ function standardDiagnosisReportHtml(task) {
             <li>若某平台长期未收录，应补发同主题不同角度内容，而不是重复发布同一篇文章。</li>
           </ul>
         </article>
+      </div>
+      <div class="strategy-tags">
+        <span>${escapeHtml(keywordText)}选择内容</span>
+        <span>品牌事实统一</span>
+        <span>AI问答证据链</span>
+        <span>未收录平台补投</span>
+      </div>
+      <div class="table-wrap data-card action-table">
+        <table>
+          <thead><tr><th>序号</th><th>动作</th><th>说明</th><th>对应模块</th></tr></thead>
+          <tbody>${actionRows}</tbody>
+        </table>
       </div>
     </section>
     <div class="footer">诊断报告云端仅保存有限周期，请及时打开、下载或保存。本报告仅基于当前平台返回结果生成，不替代人工品牌策略判断。</div>
