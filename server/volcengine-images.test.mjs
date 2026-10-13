@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {articleSceneImages,generateSceneImage,imageSource,sceneImagePrompt} from './volcengine-images.mjs'
+import {articleSceneImages,generateSceneImage,imageSource,resetPendingImageSlots,sceneImagePrompt} from './volcengine-images.mjs'
 
 test('scene prompts contain visual context, never whole article text',()=>{
  const prompt=sceneImagePrompt({project:{industry:'管理咨询'},title:'如何选择顾问',scene:'门店经营',body:'PRIVATE ARTICLE',index:0})
@@ -51,4 +51,13 @@ test('uncertain image calls are not retried automatically',async()=>{
  const state={};let calls=0
  const options={project:{name:'brand'},title:'title',body:'body',articleId:'job',state,saveState:async()=>{},findSaved:()=>null,saveImage:()=>{},generate:async()=>{calls++;throw new Error('timeout')}}
  await assert.rejects(()=>articleSceneImages(options));await assert.rejects(()=>articleSceneImages(options),/待确认/);assert.equal(calls,1)
+})
+
+test('pending image slots can be explicitly released before resume',async()=>{
+ const state={};let calls=0
+ const options={project:{name:'brand'},title:'title',body:'body',articleId:'job',state,saveState:async()=>{},findSaved:()=>null,saveImage:async()=>({path:'/image.png'}),generate:async()=>{calls++;if(calls===1)throw new Error('timeout');return {data:Buffer.from('image'),ext:'png'}}}
+ await assert.rejects(()=>articleSceneImages(options))
+ assert.equal(resetPendingImageSlots(state),1)
+ assert.equal((await articleSceneImages(options)).length,2)
+ assert.equal(calls,3)
 })

@@ -2979,14 +2979,14 @@ function Tasks({
     } catch (error) { if(token===taskRun.current){autoOpened.current='';notify(error instanceof Error ? error.message : '无法读取任务')} }
     finally{if(readingTaskRef.current===task.jobId){readingTaskRef.current='';setReadingTask('')}}
   }
-  const resumeJob = async () => {
+  const resumeJob = async (options: { resetImageSlots?: boolean } = {}) => {
     if (!activeJob || activeJob.status !== 'failed') return
     const task = currentTaskRows.find(row => row.jobId === activeJob.id)
     if (!task) { notify('未找到当前任务记录。'); return }
     const token = ++taskRun.current
     setIsGenerating(true)
     try {
-      const result = await apiJson<{ job: ArticleJobStatus }>('/api/jobs/resume', { id: activeJob.id }, 15000)
+      const result = await apiJson<{ job: ArticleJobStatus }>('/api/jobs/resume', { id: activeJob.id, resetImageSlots: Boolean(options.resetImageSlots) }, 15000)
       if (token !== taskRun.current) return
       await watchJob(result.job, task)
     } catch (error) { notify(error instanceof Error ? error.message : '续跑失败'); setIsGenerating(false) }

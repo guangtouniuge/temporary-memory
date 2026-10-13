@@ -67,7 +67,7 @@ export function ProjectUnderstandingPanel({ project, core, request, onClose, can
   </section></div>
 }
 
-export function TaskWorkflowDetails({ job, onResume, busy }: { job: any; onResume: () => void; busy: boolean }) {
+export function TaskWorkflowDetails({ job, onResume, busy }: { job: any; onResume: (options?: { resetImageSlots?: boolean }) => void; busy: boolean }) {
   const labels: Record<string,string> = { '项目理解':'项目理解', '批量选题':'分配选题角度', '选题交接':'分配选题角度', '单篇编辑':'文章策划', 'Skill写作':'正文生成', '篇幅收束':'正文生成', '成品':'文章完成' }
   const statuses: Record<string,string> = { complete:'已完成', running:'进行中', recovered:'已恢复', failed:'待重试', queued:'待开始' }
   const steps = new Map<string,string>()
@@ -75,9 +75,15 @@ export function TaskWorkflowDetails({ job, onResume, busy }: { job: any; onResum
     const label=labels[step.label] || step.label
     steps.set(label,step.status)
   }
+  const hasPendingImage = /图片结果待确认|配图.*待确认|AI配图/.test(String(job.error || '')) && (job.workflowSteps || []).some((step: any) => step.label === 'AI配图' && step.status === 'failed')
+  const resume = () => {
+    if (!hasPendingImage) return onResume()
+    if (!window.confirm('当前任务卡在待确认AI配图。请先确认火山引擎没有生成对应图片；确认后系统会释放待确认图片槽，并在续跑时重新生成该图片。是否继续？')) return
+    onResume({ resetImageSlots: true })
+  }
   if(!steps.size)steps.set('等待生成',job.status==='running'?'running':'queued')
   return <div className="workflow-details workflow-summary">
-    <div className="workflow-panel-toolbar"><strong>生成流程</strong>{job.status==='failed'&&<button className="primary-button" disabled={busy} onClick={onResume}>继续本次任务</button>}</div>
+    <div className="workflow-panel-toolbar"><strong>生成流程</strong>{job.status==='failed'&&<button className="primary-button" disabled={busy} onClick={resume}>{hasPendingImage?'确认配图失败并续跑':'继续本次任务'}</button>}</div>
     <ol>{[...steps].map(([label,status])=><li key={label}><strong>{label}</strong><span>{job.status==='done'?'已完成':statuses[status]||status}</span></li>)}</ol>
     {job.error&&<p role="alert">{job.error}</p>}
   </div>

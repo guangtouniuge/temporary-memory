@@ -13,6 +13,22 @@ export function sceneImagePrompt({project,scene,index}) {
   return `制作一张横向AI场景示意配图。画面行业和应用场景：${JSON.stringify(context)}。根据该行业选择合理的办公、门店或工作现场环境。画面侧重${index===0?'工作人员在日常业务环境中交流、观察或整理资料的宽景':'工作人员协作处理业务、查看资料或操作该行业常用工具的近景'}。使用虚构人物和通用场所，画面清晰自然，以人物动作、工具和环境构成画面。`
 }
 
+export function resetPendingImageSlots(state, reason = '管理员确认图片未生成，释放后允许续跑') {
+  const slots = state?.imageSlots
+  if (!slots || typeof slots !== 'object') return 0
+  let count = 0
+  const now = new Date().toISOString()
+  for (const slot of Object.values(slots)) {
+    if (!slot || typeof slot !== 'object') continue
+    if (!['sending', 'uncertain'].includes(slot.status)) continue
+    slot.status = 'failed'
+    slot.error = reason
+    slot.resetAt = now
+    count += 1
+  }
+  return count
+}
+
 export async function generateSceneImage(prompt,{fetchImpl=fetch,apiKey=process.env.ARK_API_KEY,model=process.env.ARK_IMAGE_MODEL,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}) {
   if(!apiKey||!model)throw Object.assign(new Error('火山引擎生图尚未配置，请联系管理员'),{confirmedFailure:true})
   let response

@@ -21,7 +21,7 @@ import { articleHtml } from './article-format.mjs'
 import { JobJournal } from './job-journal.mjs'
 import { distillSelectionTerms, distillationCount } from './keyword-distillation.mjs'
 import { expandBusinessScenes, createSceneRequests } from './business-scenes.mjs'
-import { articleSceneImages, generateSceneImage } from './volcengine-images.mjs'
+import { articleSceneImages, generateSceneImage, resetPendingImageSlots } from './volcengine-images.mjs'
 import { modelRequestOptions } from './model-request.mjs'
 import { modelResponseFailure } from './model-response.mjs'
 import { priceMedia } from './billing-pricing.mjs'
@@ -8040,6 +8040,10 @@ async function handleProjectRequest(req, res, account, requestUrl) {
       if (!record || record.job.projectId !== currentProjectScope().projectId || record.job.legacyScope !== Boolean(currentProjectScope().legacy)) return json(res, 404, { ok: false, error: '任务不存在' })
       if (record.job.status !== 'failed') return json(res, 409, { ok: false, error: '仅中断的任务可以续跑' })
       if (!canResumeWritingRelease(record.version, writingRelease.version)) return json(res, 409, { ok: false, error: '生产版本已变化，请新建任务，旧稿仍保留' })
+      if (body.resetImageSlots) {
+        const resetCount = resetPendingImageSlots(record.job.workflow, '管理员确认待确认配图未生成，允许本次续跑重新配图')
+        if (resetCount) appendJobLog(record.job, `已释放${resetCount}个待确认AI配图槽，本次续跑将重新生成对应图片`)
+      }
       record.version = writingRelease.version
       if(!currentProjectScope().legacy && record.job.completed < record.plans.length && !auth.articleResult(record.job.projectId, `${record.job.id}:${record.job.completed}`))auth.checkArticleAccess(record.job.projectId)
       record.job.status = 'queued'
